@@ -6,6 +6,8 @@ compile_error!("NextAI Translator is a Windows desktop application.");
 mod config;
 mod engine;
 mod history;
+#[cfg(test)]
+mod live_tests;
 mod provider;
 mod ui;
 

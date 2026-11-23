@@ -6,6 +6,11 @@ pub struct Provider {
 
 pub const PROVIDERS: &[Provider] = &[
     Provider {
+        name: "New API",
+        endpoint: "https://new-api.jamesflare.com",
+        model: "gpt-6-luna",
+    },
+    Provider {
         name: "OpenAI",
         endpoint: "https://api.openai.com/v1/chat/completions",
         model: "gpt-4o-mini",
@@ -57,7 +62,7 @@ mod tests {
             let s = Settings {
                 endpoint: p.endpoint.into(),
                 model: p.model.into(),
-                api_key: String::new(),
+                ..Settings::default()
             };
             assert!(validate(&s).is_ok());
             assert_eq!(identify(&s.endpoint), p.name);

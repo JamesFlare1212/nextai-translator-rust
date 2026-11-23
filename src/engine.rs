@@ -1,7 +1,12 @@
-use reqwest::{Client, Url};
-use serde::Deserialize;
+#[path = "engine/responses.rs"]
+mod responses;
+
+use reqwest::{Client, RequestBuilder, Response, Url};
+use responses::Responses;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
+    collections::HashSet,
     net::IpAddr,
     sync::atomic::{AtomicBool, Ordering},
     time::Duration,
@@ -10,24 +15,50 @@ use std::{
 const CANCELLED: &str = "翻译已停止。";
 const EMPTY: &str = "模型未返回译文。";
 const PROVIDER_ERROR: &str = "翻译服务返回错误。";
-const MALFORMED: &str = "服务响应不是有效的 Chat Completions 格式。";
+const MALFORMED: &str = "服务返回的翻译数据格式无效。";
+const REFUSED: &str = "模型拒绝翻译这段文字。";
+const TRUNCATED: &str = "已达到模型的输出上限，译文被截断。";
+const FILTERED: &str = "服务的内容过滤器阻止了此次翻译。";
+const INCOMPLETE: &str = "连接提前结束，译文可能不完整。";
 const TOO_LARGE: &str = "翻译结果过长，请分段提交。";
 const MAX_RESPONSE: usize = 16 * 1024 * 1024;
 const MAX_EVENT: usize = 1024 * 1024;
+const MAX_MODELS_BODY: usize = 2 * 1024 * 1024;
+
+#[derive(Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiMode {
+    #[default]
+    ChatCompletions,
+    Responses,
+}
+
+impl ApiMode {
+    fn path(self) -> &'static str {
+        match self {
+            Self::ChatCompletions => "chat/completions",
+            Self::Responses => "responses",
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct Settings {
     pub endpoint: String,
     pub model: String,
     pub api_key: String,
+    pub api_mode: ApiMode,
+    pub reasoning: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            endpoint: "https://api.openai.com/v1/chat/completions".into(),
-            model: "gpt-4o-mini".into(),
+            endpoint: "https://new-api.jamesflare.com".into(),
+            model: "gpt-6-luna".into(),
             api_key: String::new(),
+            api_mode: ApiMode::default(),
+            reasoning: false,
         }
     }
 }
@@ -45,6 +76,10 @@ fn validated_url(settings: &Settings) -> Result<Url, String> {
     if settings.model.trim().is_empty() || settings.model.chars().any(char::is_control) {
         return Err("请输入有效的模型名称。".into());
     }
+    api_url(settings, settings.api_mode.path())
+}
+
+fn api_url(settings: &Settings, route: &str) -> Result<Url, String> {
     if !settings
         .api_key
         .trim()
@@ -53,10 +88,9 @@ fn validated_url(settings: &Settings) -> Result<Url, String> {
     {
         return Err("API 密钥含有空格或无效字符。".into());
     }
-    let url =
-        Url::parse(settings.endpoint.trim()).map_err(|_| "请输入完整的 Chat Completions 地址。")?;
-    if url.host_str().is_none() || url.path() == "/" || url.path().is_empty() {
-        return Err("API 地址缺少请求路径，例如 /v1/chat/completions。".into());
+    let mut url = Url::parse(settings.endpoint.trim()).map_err(|_| "请输入有效的 API 地址。")?;
+    if url.host_str().is_none() {
+        return Err("API 地址缺少主机名。".into());
     }
     if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
         return Err("API 地址不能包含用户名、密码或片段标识。".into());
@@ -73,6 +107,16 @@ fn validated_url(settings: &Settings) -> Result<Url, String> {
     if url.scheme() != "https" && !(url.scheme() == "http" && loopback(&url)) {
         return Err("远程服务必须使用 HTTPS；只有本机地址可使用 HTTP。".into());
     }
+    let path = url.path().trim_end_matches('/');
+    let base = if path.is_empty() {
+        "/v1"
+    } else {
+        path.strip_suffix("/chat/completions")
+            .or_else(|| path.strip_suffix("/responses"))
+            .or_else(|| path.strip_suffix("/models"))
+            .unwrap_or(path)
+    };
+    url.set_path(&format!("{base}/{route}"));
     Ok(url)
 }
 
@@ -130,60 +174,21 @@ pub fn translate(
     }
 
     let prompt = translation_prompt(source, target, text);
-    let body = json!({ "model": model, "stream": true, "messages": [
-        { "role": "system", "content": prompt }, { "role": "user", "content": text }
-    ] });
-
-    if tokio::runtime::Handle::try_current().is_ok() {
-        return Err("无法在当前线程启动翻译。".into());
-    }
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|_| "无法启动翻译线程。")?;
+    let body = translation_body(settings, model, &prompt, text);
+    let runtime = network_runtime()?;
     let result = runtime.block_on(async {
         let mut request = std::pin::pin!(async {
-            let mut builder = Client::builder()
-                .connect_timeout(Duration::from_secs(10))
-                .read_timeout(Duration::from_secs(60))
-                .timeout(Duration::from_secs(180))
-                .redirect(reqwest::redirect::Policy::none());
-            if loopback(&url) {
-                builder = builder.no_proxy();
-                if url.host_str() == Some("localhost") {
-                    builder = builder.resolve_to_addrs(
-                        "localhost",
-                        &[
-                            std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, 0)),
-                            std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0)),
-                        ],
-                    );
-                }
-            }
-            let client = builder.build().map_err(|_| "无法初始化网络连接。")?;
-            let mut post = client
+            let post = client(&url, Duration::from_secs(180))?
                 .post(url)
                 .header(
                     reqwest::header::ACCEPT,
                     "text/event-stream, application/json",
                 )
                 .json(&body);
-            if !settings.api_key.trim().is_empty() {
-                post = post.bearer_auth(settings.api_key.trim());
-            }
-            let mut response = post.send().await.map_err(network_error)?;
-            let status = response.status();
-            if !status.is_success() {
-                let hint = match status.as_u16() {
-                    301..=399 => "不跟随重定向，请填写服务的最终地址。",
-                    401 | 403 => "请检查 API 密钥和模型访问权限。",
-                    404 => "请检查 API 地址和模型名称。",
-                    429 => "请求过于频繁或额度不足，请检查配额后重试。",
-                    _ => "翻译服务拒绝了此次请求。",
-                };
-                return Err(format!("HTTP {}. {hint}", status.as_u16()));
-            }
+            let mut response = send(post, settings).await?;
             let mut answer = Answer {
+                api_mode: settings.api_mode,
+                responses: Responses::default(),
                 seen_text: false,
                 cancel,
                 on_delta: &mut on_delta,
@@ -211,10 +216,10 @@ pub fn translate(
                 }
             }
             if is_json == Some(true) {
-                answer.decode(&document, false)?;
+                answer.decode(&document, None)?;
                 answer.complete()
             } else {
-                Err("连接提前结束，译文可能不完整。".into())
+                Err(INCOMPLETE.into())
             }
         });
         loop {
@@ -229,6 +234,145 @@ pub fn translate(
     });
     runtime.shutdown_background();
     result
+}
+
+fn translation_body(
+    settings: &Settings,
+    model: &str,
+    prompt: &str,
+    text: &str,
+) -> serde_json::Value {
+    let mut body = match settings.api_mode {
+        ApiMode::ChatCompletions => json!({ "model": model, "stream": true, "messages": [
+            { "role": "system", "content": prompt }, { "role": "user", "content": text }
+        ] }),
+        ApiMode::Responses => {
+            json!({ "model": model, "stream": true, "instructions": prompt, "input": text })
+        }
+    };
+    let effort = if settings.reasoning {
+        "medium"
+    } else if supports_no_reasoning(model) {
+        "none"
+    } else {
+        return body;
+    };
+    match settings.api_mode {
+        ApiMode::ChatCompletions => body["reasoning_effort"] = json!(effort),
+        ApiMode::Responses => body["reasoning"] = json!({"effort": effort}),
+    }
+    body
+}
+
+fn supports_no_reasoning(model: &str) -> bool {
+    let model = model.strip_prefix("openai/").unwrap_or(model);
+    let family = model.split('-').nth(1).unwrap_or("");
+    model == "gpt-6-luna"
+        || (model.starts_with("gpt-5.")
+            && family
+                .strip_prefix("5.")
+                .and_then(|minor| minor.parse::<u32>().ok())
+                .is_some_and(|minor| minor > 0)
+            && !model
+                .split('-')
+                .any(|s| matches!(s, "pro" | "codex" | "chat")))
+}
+
+fn network_runtime() -> Result<tokio::runtime::Runtime, String> {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        return Err("无法在当前线程启动网络请求。".into());
+    }
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| "无法启动网络线程。".into())
+}
+
+fn client(url: &Url, timeout: Duration) -> Result<Client, String> {
+    let mut builder = Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .read_timeout(Duration::from_secs(60))
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none());
+    if loopback(url) {
+        builder = builder.no_proxy();
+        if url.host_str() == Some("localhost") {
+            builder = builder.resolve_to_addrs(
+                "localhost",
+                &[
+                    std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, 0)),
+                    std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0)),
+                ],
+            );
+        }
+    }
+    builder.build().map_err(|_| "无法初始化网络连接。".into())
+}
+
+async fn send(mut request: RequestBuilder, settings: &Settings) -> Result<Response, String> {
+    if !settings.api_key.trim().is_empty() {
+        request = request.bearer_auth(settings.api_key.trim());
+    }
+    let response = request.send().await.map_err(network_error)?;
+    let status = response.status();
+    if status.is_success() {
+        return Ok(response);
+    }
+    let hint = match status.as_u16() {
+        300..=399 => "不跟随重定向，请填写服务的最终地址。",
+        401 | 403 => "请检查 API 密钥和模型访问权限。",
+        404 => "请检查 API 地址和模型名称。",
+        429 => "请求过于频繁或额度不足，请检查配额后重试。",
+        _ => "翻译服务拒绝了此次请求。",
+    };
+    Err(format!("HTTP {}. {hint}", status.as_u16()))
+}
+
+pub fn list_models(settings: &Settings) -> Result<Vec<String>, String> {
+    let url = api_url(settings, "models")?;
+    let runtime = network_runtime()?;
+    let result = runtime.block_on(async {
+        let get = client(&url, Duration::from_secs(20))?
+            .get(url)
+            .header(reqwest::header::ACCEPT, "application/json");
+        let mut response = send(get, settings).await?;
+        let mut document = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(network_error)? {
+            if chunk.len() > MAX_MODELS_BODY - document.len() {
+                return Err("模型列表过长。".into());
+            }
+            document.extend_from_slice(&chunk);
+        }
+        parse_models(&document)
+    });
+    runtime.shutdown_background();
+    result
+}
+
+fn parse_models(bytes: &[u8]) -> Result<Vec<String>, String> {
+    #[derive(Deserialize)]
+    struct Models {
+        data: Option<Vec<Model>>,
+        error: Option<serde::de::IgnoredAny>,
+    }
+    #[derive(Deserialize)]
+    struct Model {
+        id: Option<String>,
+    }
+    let malformed = "服务返回的模型列表格式无效。";
+    let models: Models = serde_json::from_slice(bytes).map_err(|_| malformed)?;
+    if models.error.is_some() {
+        return Err(PROVIDER_ERROR.into());
+    }
+    let rows = models.data.ok_or(malformed)?;
+    let mut seen = HashSet::new();
+    Ok(rows
+        .iter()
+        .filter_map(|m| m.id.as_deref())
+        .map(str::trim)
+        .filter(|id| !id.is_empty() && !id.chars().any(char::is_control) && seen.insert(*id))
+        .map(str::to_owned)
+        .collect())
 }
 
 fn network_error(error: reqwest::Error) -> String {
@@ -267,6 +411,8 @@ struct Message {
 }
 
 struct Answer<'a, F> {
+    api_mode: ApiMode,
+    responses: Responses,
     seen_text: bool,
     cancel: &'a AtomicBool,
     on_delta: &'a mut F,
@@ -281,7 +427,20 @@ impl<F: FnMut(&str)> Answer<'_, F> {
         }
     }
 
-    fn decode(&mut self, bytes: &[u8], stream: bool) -> Result<bool, String> {
+    fn decode(&mut self, bytes: &[u8], event: Option<&[u8]>) -> Result<bool, String> {
+        let mut emit = |content: &str| {
+            if !content.is_empty() {
+                check_cancel(self.cancel)?;
+                (self.on_delta)(content);
+                check_cancel(self.cancel)?;
+                self.seen_text = true;
+            }
+            Ok(())
+        };
+        if self.api_mode == ApiMode::Responses {
+            return self.responses.decode(bytes, event, emit);
+        }
+        let stream = event.is_some();
         let completion: Completion = serde_json::from_slice(bytes).map_err(|_| MALFORMED)?;
         if completion.error.is_some() {
             return Err(PROVIDER_ERROR.into());
@@ -291,20 +450,17 @@ impl<F: FnMut(&str)> Answer<'_, F> {
         };
         if let Some(message) = if stream { choice.delta } else { choice.message } {
             if message.refusal.is_some_and(|s| !s.is_empty()) {
-                return Err("模型拒绝翻译这段文字。".into());
+                return Err(REFUSED.into());
             }
-            if let Some(content) = message.content.filter(|s| !s.is_empty()) {
-                check_cancel(self.cancel)?;
-                (self.on_delta)(&content);
-                check_cancel(self.cancel)?;
-                self.seen_text = true;
+            if let Some(content) = message.content {
+                emit(&content)?;
             }
         }
         match choice.finish_reason.as_deref() {
             None | Some("") => Ok(false),
             Some("stop") => Ok(true),
-            Some("length") => Err("已达到模型的输出上限，译文被截断。".into()),
-            Some("content_filter") => Err("服务的内容过滤器阻止了此次翻译。".into()),
+            Some("length") => Err(TRUNCATED.into()),
+            Some("content_filter") => Err(FILTERED.into()),
             _ => Err("模型在译文完成前停止输出。".into()),
         }
     }
@@ -316,7 +472,7 @@ struct Sse {
     data: Vec<u8>,
     after_cr: bool,
     started: bool,
-    error_event: bool,
+    event: Vec<u8>,
 }
 
 impl Sse {
@@ -340,15 +496,23 @@ impl Sse {
                 };
                 self.started = true;
                 if line.is_empty() {
-                    if self.error_event {
+                    if self.event == b"error" || self.event == b"response.failed" {
                         return Err(PROVIDER_ERROR.into());
                     }
                     if self.data.pop().is_some() {
-                        if self.data.trim_ascii() == b"[DONE]" || answer.decode(&self.data, true)? {
+                        if self.data.trim_ascii() == b"[DONE]" {
+                            return if answer.api_mode == ApiMode::Responses {
+                                Err(INCOMPLETE.into())
+                            } else {
+                                Ok(true)
+                            };
+                        }
+                        if answer.decode(&self.data, Some(&self.event))? {
                             return Ok(true);
                         }
                         self.data.clear();
                     }
+                    self.event.clear();
                 } else {
                     let (name, value) = match line.iter().position(|b| *b == b':') {
                         Some(pos) => (
@@ -367,7 +531,10 @@ impl Sse {
                             self.data.extend_from_slice(value);
                             self.data.push(b'\n');
                         }
-                        b"event" => self.error_event = value == b"error",
+                        b"event" => {
+                            self.event.clear();
+                            self.event.extend_from_slice(value);
+                        }
                         _ => {}
                     }
                 }
@@ -384,329 +551,5 @@ impl Sse {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::{
-        io::{BufRead, BufReader, Read, Write},
-        net::{TcpListener, TcpStream},
-        sync::{Arc, mpsc},
-        thread::{self, JoinHandle},
-    };
-
-    const KEY: &str = "fake-test-key-do-not-display";
-
-    fn server(
-        serve: impl FnOnce(TcpStream, String, serde_json::Value) + Send + 'static,
-    ) -> (Settings, JoinHandle<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let endpoint = format!(
-            "http://{}/v1/chat/completions",
-            listener.local_addr().unwrap()
-        );
-        let handle = thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
-            let mut reader = BufReader::new(&stream);
-            let mut headers = String::new();
-            loop {
-                let mut line = String::new();
-                assert_ne!(reader.read_line(&mut line).unwrap(), 0);
-                if line == "\r\n" {
-                    break;
-                }
-                headers.push_str(&line);
-            }
-            let len: usize = headers
-                .lines()
-                .find_map(|line| {
-                    let (name, value) = line.split_once(':')?;
-                    name.eq_ignore_ascii_case("content-length")
-                        .then(|| value.trim().parse().unwrap())
-                })
-                .unwrap();
-            let mut body = vec![0; len];
-            reader.read_exact(&mut body).unwrap();
-            serve(stream, headers, serde_json::from_slice(&body).unwrap());
-        });
-        (
-            Settings {
-                endpoint,
-                model: "test-model".into(),
-                api_key: KEY.into(),
-            },
-            handle,
-        )
-    }
-
-    fn response(mut stream: TcpStream, status: &str, kind: &str, body: &str) {
-        write!(stream, "HTTP/1.1 {status}\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
-    }
-
-    fn chunk(stream: &mut TcpStream, bytes: &[u8]) {
-        write!(stream, "{:x}\r\n", bytes.len()).unwrap();
-        stream.write_all(bytes).unwrap();
-        stream.write_all(b"\r\n").unwrap();
-    }
-
-    #[test]
-    fn streams_multiline_events_and_utf8_across_http_chunks_before_completion() {
-        let (ack, first_delta) = mpsc::channel();
-        let (settings, handle) = server(move |mut stream, headers, body| {
-            assert!(headers.starts_with("POST /v1/chat/completions HTTP/1.1"));
-            assert!(
-                headers
-                    .to_ascii_lowercase()
-                    .contains(&format!("authorization: bearer {KEY}\r\n"))
-            );
-            assert_eq!(body["model"], "test-model");
-            assert_eq!(body["stream"], true);
-            assert_eq!(
-                body["messages"][1],
-                json!({"role":"user","content":"Hello,\nworld!"})
-            );
-            let prompt = body["messages"][0]["content"].as_str().unwrap();
-            assert!(prompt.contains("Detect the source language") && prompt.contains("French"));
-            assert!(!prompt.contains("dictionary") && !body.to_string().contains(KEY));
-
-            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n").unwrap();
-            let first = "\u{feff}: heartbeat\r\n\r\ndata: {\"choices\":[]}\r\n\r\nevent: message\r\ndata: {\"choices\":[\r\ndata: {\"delta\":{\"content\":\"你\"}}]}\r\n\r\n";
-            let split = first.find('你').unwrap() + 1;
-            chunk(&mut stream, &first.as_bytes()[..split]);
-            chunk(&mut stream, &first.as_bytes()[split..]);
-            first_delta.recv_timeout(Duration::from_secs(5)).unwrap();
-            chunk(&mut stream, "data: {\"choices\":[{\"delta\":{\"content\":\"好\"},\"finish_reason\":\"stop\"}]}\n\n".as_bytes());
-        });
-        let mut parts = Vec::new();
-        translate(
-            &settings,
-            "Auto",
-            "French",
-            "Hello,\nworld!",
-            &AtomicBool::new(false),
-            |part| {
-                parts.push(part.to_owned());
-                if parts.len() == 1 {
-                    ack.send(()).unwrap();
-                }
-            },
-        )
-        .unwrap();
-        handle.join().unwrap();
-        assert_eq!(parts, ["你", "好"]);
-    }
-
-    #[test]
-    fn keyless_model_accepts_json_and_receives_dictionary_instructions_for_one_word() {
-        let (mut settings, handle) = server(|stream, headers, body| {
-            assert!(!headers.to_ascii_lowercase().contains("authorization:"));
-            let prompt = body["messages"][0]["content"].as_str().unwrap();
-            for expected in [
-                "English into Chinese",
-                "dictionary entry in Chinese",
-                "original form",
-                "parts of speech",
-                "three bilingual example sentences",
-                "etymology",
-            ] {
-                assert!(prompt.contains(expected), "missing {expected}");
-            }
-            assert_eq!(body["messages"][1]["content"], "rivers");
-            response(
-                stream,
-                "200 OK",
-                "application/json",
-                r#"{"choices":[{"message":{"role":"assistant","content":"河流\nriver, noun"},"finish_reason":"stop"}]}"#,
-            );
-        });
-        settings.api_key.clear();
-        let mut parts = Vec::new();
-        translate(
-            &settings,
-            "English",
-            "Chinese",
-            "rivers",
-            &AtomicBool::new(false),
-            |part| parts.push(part.to_owned()),
-        )
-        .unwrap();
-        handle.join().unwrap();
-        assert_eq!(parts, ["河流\nriver, noun"]);
-    }
-
-    fn exchange(status: &'static str, body: String) -> (String, Result<(), String>) {
-        let (settings, handle) =
-            server(move |stream, _, _| response(stream, status, "text/plain", &body));
-        let mut text = String::new();
-        let result = translate(
-            &settings,
-            "English",
-            "German",
-            "Some text",
-            &AtomicBool::new(false),
-            |part| text.push_str(part),
-        );
-        handle.join().unwrap();
-        (text, result)
-    }
-
-    #[test]
-    fn done_marker_and_incomplete_results_are_distinct() {
-        let partial = "data: {\"choices\":[{\"delta\":{\"content\":\"Hallo\"}}]}\n\n";
-        let (text, result) = exchange("200 OK", format!("{partial}data: [DONE]\n\n"));
-        assert_eq!((text.as_str(), result), ("Hallo", Ok(())));
-        let (text, result) = exchange("200 OK", partial.into());
-        assert_eq!(text, "Hallo");
-        assert!(result.unwrap_err().contains("提前结束"));
-        let (_, result) = exchange("200 OK", "data: [DONE]\n\n".into());
-        assert_eq!(result.unwrap_err(), EMPTY);
-        let (_, result) = exchange(
-            "200 OK",
-            "data: {\"choices\":[{\"finish_reason\":\"length\"}]}\n\n".into(),
-        );
-        assert!(result.unwrap_err().contains("截断"));
-    }
-
-    #[test]
-    fn handles_http_json_sse_and_malformed_errors_without_displaying_secrets() {
-        for (status, body, expected) in [
-            ("401 Unauthorized", KEY.to_owned(), "HTTP 401"),
-            (
-                "200 OK",
-                format!(r#"{{"error":{{"message":"{KEY}"}}}}"#),
-                PROVIDER_ERROR,
-            ),
-            (
-                "200 OK",
-                format!("data: {{\"error\":\"{KEY}\"}}\n\n"),
-                PROVIDER_ERROR,
-            ),
-            (
-                "200 OK",
-                format!("event: error\ndata: {KEY}\n\n"),
-                PROVIDER_ERROR,
-            ),
-            ("200 OK", format!("data: {KEY}\n\n"), MALFORMED),
-        ] {
-            let (text, result) = exchange(status, body);
-            assert!(text.is_empty());
-            let err = result.unwrap_err();
-            assert!(err.contains(expected) && !err.contains(KEY));
-        }
-    }
-
-    #[test]
-    fn cancels_while_waiting_for_headers_and_disconnects() {
-        let cancel = Arc::new(AtomicBool::new(false));
-        let request_cancel = cancel.clone();
-        let (settings, handle) = server(move |mut stream, _, _| {
-            request_cancel.store(true, Ordering::Release);
-            let mut byte = [0];
-            match stream.read(&mut byte) {
-                Ok(n) => assert_eq!(n, 0),
-                Err(e) => assert!(matches!(
-                    e.kind(),
-                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
-                )),
-            }
-        });
-        let result = translate(&settings, "Auto", "English", "Hallo", &cancel, |_| {
-            panic!("unexpected delta")
-        });
-        assert_eq!(result.unwrap_err(), CANCELLED);
-        handle.join().unwrap();
-    }
-
-    #[test]
-    fn cancellation_in_callback_skips_even_already_buffered_deltas() {
-        let (settings, handle) = server(|stream, _, _| {
-            response(
-                stream,
-                "200 OK",
-                "text/event-stream",
-                "data: {\"choices\":[{\"delta\":{\"content\":\"one\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"two\"}}]}\n\ndata: [DONE]\n\n",
-            );
-        });
-        let cancel = AtomicBool::new(false);
-        let mut text = String::new();
-        let result = translate(&settings, "Auto", "Chinese", "one two", &cancel, |part| {
-            text.push_str(part);
-            cancel.store(true, Ordering::Release);
-        });
-        assert_eq!(result.unwrap_err(), CANCELLED);
-        assert_eq!(text, "one");
-        handle.join().unwrap();
-    }
-
-    #[test]
-    fn never_follows_a_redirect_with_credentials_or_user_text() {
-        let dest = TcpListener::bind("127.0.0.1:0").unwrap();
-        let location = format!("http://{}/elsewhere", dest.local_addr().unwrap());
-        let (settings, handle) = server(move |mut stream, _, _| {
-            write!(stream, "HTTP/1.1 307 Temporary Redirect\r\nLocation: {location}\r\nContent-Length: 0\r\n\r\n").unwrap();
-        });
-        let err = translate(
-            &settings,
-            "Auto",
-            "Chinese",
-            "secret text",
-            &AtomicBool::new(false),
-            |_| {},
-        )
-        .unwrap_err();
-        assert!(err.contains("HTTP 307"));
-        handle.join().unwrap();
-        dest.set_nonblocking(true).unwrap();
-        assert_eq!(
-            dest.accept().unwrap_err().kind(),
-            std::io::ErrorKind::WouldBlock
-        );
-    }
-
-    #[test]
-    fn validates_settings_without_network_or_secret_disclosure() {
-        let mut settings = Settings::default();
-        for address in [
-            "https://api.example/v1/chat/completions?api-version=2025-01",
-            "http://127.0.0.42:11434/proxy",
-            "http://localhost:8080/completions",
-            "http://[::1]/v1/chat/completions",
-        ] {
-            settings.endpoint = address.into();
-            validate(&settings).unwrap();
-        }
-        for address in [
-            "http://api.example/v1/chat/completions",
-            "http://localhost.example/proxy",
-            "https://secret@example.org/path",
-            "http://[::]/path",
-            "file:///tmp/model",
-            "https://example.org/path#token",
-            "https://example.org/path?api_key=secret",
-            "https://example.org",
-            "not a URL",
-        ] {
-            settings.endpoint = address.into();
-            assert!(!validate(&settings).unwrap_err().contains("secret"));
-        }
-        settings = Settings::default();
-        settings.api_key = format!("{KEY}\r\nHeader: value");
-        assert!(!validate(&settings).unwrap_err().contains(KEY));
-        settings = Settings::default();
-        settings.model = " ".into();
-        assert!(validate(&settings).is_err());
-        assert_eq!(
-            translate(
-                &settings,
-                "Auto",
-                "English",
-                "a",
-                &AtomicBool::new(true),
-                |_| {}
-            )
-            .unwrap_err(),
-            CANCELLED
-        );
-    }
-}
+#[path = "engine/tests.rs"]
+mod tests;

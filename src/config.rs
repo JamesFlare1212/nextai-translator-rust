@@ -1,4 +1,8 @@
-use crate::engine::Settings;
+use crate::engine::{ApiMode, Settings};
+
+pub const DEFAULT_FONT: &str = "MiSans";
+pub const DEFAULT_SIZE: u8 = 15;
+pub const FONT_SIZES: std::ops::RangeInclusive<u8> = 10..=36;
 use serde::{Deserialize, Serialize};
 use std::{
     env, fs,
@@ -28,6 +32,8 @@ pub enum Appearance {
 pub struct Preferences {
     pub appearance: Appearance,
     pub target: String,
+    pub font_family: String,
+    pub font_size: u8,
 }
 
 impl Default for Preferences {
@@ -35,6 +41,8 @@ impl Default for Preferences {
         Self {
             appearance: Appearance::System,
             target: "Simplified Chinese".into(),
+            font_family: DEFAULT_FONT.into(),
+            font_size: DEFAULT_SIZE,
         }
     }
 }
@@ -43,6 +51,10 @@ impl Default for Preferences {
 struct Stored {
     endpoint: String,
     model: String,
+    #[serde(default)]
+    api_mode: ApiMode,
+    #[serde(default)]
+    reasoning: bool,
     protected_key: Vec<u8>,
     #[serde(default)]
     preferences: Preferences,
@@ -110,13 +122,22 @@ fn read_at(path: &Path) -> Result<(Settings, Preferences), String> {
         serde_json::from_slice(&bytes).map_err(|_| "设置文件已损坏，请重新保存设置。")?;
     let api_key = String::from_utf8(crypt(&stored.protected_key, false)?)
         .map_err(|_| "无法读取已保存的 API 密钥。")?;
+    let mut preferences = stored.preferences;
+    preferences.font_size = preferences
+        .font_size
+        .clamp(*FONT_SIZES.start(), *FONT_SIZES.end());
+    if preferences.font_family.trim().is_empty() {
+        preferences.font_family = DEFAULT_FONT.into();
+    }
     Ok((
         Settings {
             endpoint: stored.endpoint,
             model: stored.model,
             api_key,
+            api_mode: stored.api_mode,
+            reasoning: stored.reasoning,
         },
-        stored.preferences,
+        preferences,
     ))
 }
 
@@ -126,6 +147,8 @@ fn write_at(path: &Path, settings: &Settings, preferences: &Preferences) -> Resu
     let stored = Stored {
         endpoint: settings.endpoint.clone(),
         model: settings.model.clone(),
+        api_mode: settings.api_mode,
+        reasoning: settings.reasoning,
         protected_key: crypt(settings.api_key.as_bytes(), true)?,
         preferences: preferences.clone(),
     };
@@ -157,12 +180,18 @@ mod tests {
         let path = dir.path().join("子目录/settings.json");
         let (mut s, mut preferences) = read_at(&path).unwrap();
         preferences.appearance = Appearance::Dark;
+        preferences.font_family = "Segoe UI".into();
+        preferences.font_size = 22;
+        s.reasoning = true;
+        s.api_mode = ApiMode::Responses;
         s.api_key = "synthetic-key-123".to_owned();
         s.model = "local-model".into();
         write_at(&path, &s, &preferences).unwrap();
         assert!(!fs::read_to_string(&path).unwrap().contains(&s.api_key));
         let (saved, actual) = read_at(&path).unwrap();
         assert_eq!(actual, preferences);
+        assert_eq!(saved.api_mode, ApiMode::Responses);
+        assert!(saved.reasoning);
         assert_eq!(
             (saved.model, saved.api_key),
             (s.model.clone(), s.api_key.clone())
@@ -170,6 +199,22 @@ mod tests {
         s.api_key.clear();
         write_at(&path, &s, &preferences).unwrap();
         assert!(read_at(&path).unwrap().0.api_key.is_empty());
+    }
+
+    #[test]
+    fn old_preferences_keep_model_and_gain_new_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        fs::write(&path, r#"{"endpoint":"https://example.org/v1/chat/completions","model":"my-model","protected_key":[],"preferences":{"appearance":"dark","target":"French"}}"#).unwrap();
+        let (settings, prefs) = read_at(&path).unwrap();
+        assert_eq!(settings.model, "my-model");
+        assert_eq!(settings.api_mode, ApiMode::ChatCompletions);
+        assert!(!settings.reasoning);
+        assert_eq!(prefs.target, "French");
+        assert_eq!(
+            (prefs.font_family.as_str(), prefs.font_size),
+            ("MiSans", 15)
+        );
     }
 
     #[test]

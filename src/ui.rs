@@ -1,5 +1,6 @@
 mod language;
 mod preferences;
+mod typography;
 use language::{AUTO, CHINESE, ENGLISH, LANGUAGES, Language, automatic_target, detect, language};
 
 use crate::{
@@ -185,12 +186,14 @@ impl Translator {
             window,
             cx,
         );
-        let form = preferences::OptionsForm::new(&settings, &preferences, window, cx);
+        let mut form = preferences::OptionsForm::new(&settings, &preferences, window, cx);
         form.reset(&settings, &preferences, window, cx);
         preferences::apply(preferences.appearance, window, cx);
+        typography::apply(&preferences, cx);
         cx.observe_window_appearance(window, |this, w, cx| {
             if this.preferences.appearance == config::Appearance::System {
                 preferences::apply(config::Appearance::System, w, cx);
+                typography::apply(&this.preferences, cx);
             }
         })
         .detach();
@@ -237,6 +240,7 @@ impl Translator {
                 .masked(true)
                 .default_value(settings.api_key.clone())
         });
+        preferences::observe_model_inputs(&endpoint, &api_key, window, cx);
         if page == Page::Translator {
             editor.focus_handle(cx).focus(window, cx);
         } else {
@@ -517,14 +521,12 @@ impl Translator {
             endpoint: self.endpoint.read(cx).value().trim().into(),
             model: self.model.read(cx).value().trim().into(),
             api_key: self.api_key.read(cx).value().trim().into(),
+            api_mode: self.form.api_mode(cx),
+            reasoning: self.form.reasoning(),
         };
         let prefs = self.form.preferences(cx);
-        let origin = |s: &str| reqwest::Url::parse(s).ok().map(|u| u.origin());
-        if !settings.api_key.is_empty()
-            && settings.api_key == self.settings.api_key
-            && origin(&settings.endpoint) != origin(&self.settings.endpoint)
-        {
-            self.notice = Some("更换服务地址后，请清除原服务的密钥或使用新服务的密钥。".into());
+        if let Err(e) = preferences::validate_draft_origin(&self.settings, &settings) {
+            self.notice = Some(e);
             cx.notify();
             return;
         }
@@ -540,6 +542,7 @@ impl Translator {
                     );
                 }
                 preferences::apply(prefs.appearance, window, cx);
+                typography::apply(&prefs, cx);
                 self.preferences = prefs;
                 self.settings = settings;
                 self.back(window, cx);
@@ -552,6 +555,7 @@ impl Translator {
     }
 
     fn back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.form.cancel_models();
         self.page = Page::Translator;
         self.notice = None;
         self.confirming_clear = false;
@@ -683,10 +687,13 @@ impl Translator {
                 div().flex_1().min_h_0().child(
                     Textarea::new(&self.editor)
                         .aria_label("原文")
+                        .bordered(false)
+                        .border_1()
+                        .border_color(cx.theme().input)
                         .h(relative(1.))
                         .w_full()
                         .rounded(px(8.))
-                        .text_size(px(15.))
+                        .text_size(px(self.preferences.font_size.into()))
                         .bg(cx.theme().secondary.opacity(0.65)),
                 ),
             )
@@ -768,8 +775,8 @@ impl Translator {
             body = body.child(
                 div()
                     .w_full()
-                    .text_size(px(15.))
-                    .line_height(px(23.))
+                    .text_size(px(self.preferences.font_size.into()))
+                    .line_height(px(f32::from(self.preferences.font_size) * 1.55))
                     .child(SelectableText::new("translation", self.output.clone())),
             );
         }
