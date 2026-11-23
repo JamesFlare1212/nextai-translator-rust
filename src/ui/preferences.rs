@@ -40,6 +40,10 @@ pub(super) fn apply(mode: Appearance, window: &mut Window, cx: &mut App) {
         Appearance::Dark => ThemeMode::Dark,
     };
     Theme::change(theme, Some(window), cx);
+    Theme::update(cx, |theme| {
+        theme.focus_ring = false;
+        theme.ring = theme.input.blend(theme.foreground.alpha(0.16));
+    });
 }
 
 pub(super) struct OptionsForm {

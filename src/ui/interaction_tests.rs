@@ -63,6 +63,25 @@ fn open_test_window(
 }
 
 #[gpui_kit::test]
+fn theme_switch_keeps_the_focus_cue_on_the_existing_border(cx: &mut TestAppContext) {
+    use crate::config::Appearance;
+    use gpui_kit::component::ActiveTheme;
+
+    let (handle, _) = open_test_window(cx);
+    cx.update_window(handle, |_, window, cx| {
+        for mode in [Appearance::Light, Appearance::Dark, Appearance::System] {
+            super::preferences::apply(mode, window, cx);
+            let theme = cx.theme();
+            let delta = theme.ring.l - theme.input.l;
+            assert!(!theme.focus_ring);
+            assert!(delta.abs() > 0.0 && delta.abs() < 0.2);
+            assert_eq!(delta.is_sign_positive(), theme.is_dark());
+        }
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
 fn restored_pair_can_be_copied_without_a_network_request(cx: &mut TestAppContext) {
     let (handle, view) = open_test_window(cx);
     cx.update_window(handle, |_, w, cx| {
