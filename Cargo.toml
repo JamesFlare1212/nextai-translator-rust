@@ -1,0 +1,29 @@
+[package]
+name = "nextai-translator"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Translation-only NextAI desktop client for Windows"
+license = "AGPL-3.0-only"
+
+[target.'cfg(windows)'.dependencies]
+gpui-kit = { version = "=0.11.0", default-features = false, features = ["component", "assets"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+tokio = { version = "1", features = ["rt", "time"] }
+whatlang = "0.16"
+windows-sys = { version = "0.61", features = ["Win32_Security_Cryptography", "Win32_Foundation"] }
+
+[target.'cfg(windows)'.dev-dependencies]
+gpui-kit = { version = "=0.11.0", default-features = false, features = ["test-support", "component", "assets"] }
+
+[target.'cfg(windows)'.build-dependencies]
+embed-resource = "3"
+
+[profile.dev]
+debug = 0
+
+[profile.release]
+strip = "symbols"
