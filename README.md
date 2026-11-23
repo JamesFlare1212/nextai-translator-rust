@@ -31,9 +31,9 @@ cargo build --locked --release --target x86_64-pc-windows-msvc
 .\target\x86_64-pc-windows-msvc\release\nextai-translator.exe
 ```
 
-[GitHub Actions](.github/workflows/windows.yml) 在推送和拉取请求时执行上述检查、构建 Windows x64 程序，并上传 `nextai-translator-windows-x64`。常规测试全部离线，不消耗 API 额度。
+[GitHub Actions](.github/workflows/windows.yml) 在推送和拉取请求时执行上述检查、构建 Windows x64 程序，并上传 `nextai-translator-windows-x64`。PR 与非默认分支只运行离线测试。推送到默认分支或在该分支手动运行时，CI 额外使用仓库 Secret `NEW_API_KEY` 执行实网测试；密钥缺失或测试失败会阻止打包。
 
-实网验收仅使用 `https://new-api.jamesflare.com` 和 `gpt-6-luna`。通过 T3 密钥卡获取临时文件，把**文件路径**设置为 `NEXTAI_TEST_KEY_FILE`，然后运行以下命令。它会检查模型列表，并分别测试两种协议的思考开/关，不输出密钥。
+实网验收仅使用 `https://new-api.jamesflare.com` 和 `gpt-6-luna`。本地复测时，通过 T3 密钥卡获取临时文件，把**文件路径**设置为 `NEXTAI_TEST_KEY_FILE`，然后运行以下命令。它会检查模型列表，并分别测试两种协议的思考开/关，不输出密钥。
 
 ```powershell
 cargo test --locked --release new_api_gpt_6_luna -- --ignored

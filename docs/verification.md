@@ -14,6 +14,6 @@
 | 无润色与总结 | `src/engine.rs::translate` 只有翻译与单词释义请求；工具栏和设置没有其他文本任务。语言列表中的 `Polish` 是波兰语。 |
 | 无 TTS 与截图翻译 | 没有朗读、语音合成、截图、OCR、图片上传处理或对应设置。GPUI Kit 启用 `component`、`assets`，不启用语音功能。 |
 | 无生词本和记忆内容生成 | `src/history.rs` 保存完整原文、译文及方向，用于恢复翻译，不收集单词或生成记忆文章。UI 仅有翻译、设置和历史三个视图。 |
-| GitHub CI | `.github/workflows/windows.yml` 配置 push、PR 和手动触发；Windows 执行格式、Clippy、测试、MSVC release 构建并上传可执行文件。工作流通过 `actionlint`。实网测试默认跳过，不向 Actions 提供密钥。 |
+| GitHub CI | `.github/workflows/windows.yml` 配置 push、PR 和手动触发；Windows 执行格式、Clippy、测试、MSVC release 构建并上传可执行文件。工作流通过 `actionlint`。仅默认分支 push 和该分支的手动运行额外执行实网测试。仓库 Secret `NEW_API_KEY` 只注入该步骤；PR 不执行实网测试。 |
 
 本地运行 `cargo fmt --all -- --check`、`cargo clippy --release --locked --all-targets --target x86_64-pc-windows-gnu -- -D warnings`、`cargo test --release --locked --all-targets --target x86_64-pc-windows-gnu` 和相同目标的 `cargo build --release --locked` 均通过。26 项离线测试通过；另行显式运行了 `live_tests::new_api_gpt_6_luna`。它先检查真实模型列表，再分别以 Chat Completions 和 Responses 测试思考开、关四种组合。离线测试覆盖两种流式协议、凭据保护、旧设置迁移、模型列表与自定义输入、历史、语言方向，以及 GPUI 组件上的输入、换行和复制等操作。Windows GNU 是本机验证目标；仓库 CI 配置使用 Windows MSVC，两者没有混称为同一次运行。
