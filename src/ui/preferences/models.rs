@@ -229,7 +229,7 @@ impl Translator {
             api_mode: self.form.api_mode(cx),
             reasoning: self.form.reasoning(),
         };
-        let state = match validate_draft_origin(&self.settings, &draft) {
+        let state = match self.check_origin(&draft) {
             Err(error) => Models::Error(error),
             Ok(()) => {
                 let settings = draft.clone();
@@ -262,7 +262,7 @@ impl Translator {
             }
             Ok(_) => {
                 self.form.model.replace_choices(vec![], w, cx);
-                Models::Error("服务未列出模型，可输入自定义名称。".into())
+                Models::Error("未找到适合翻译的模型，可输入自定义名称。".into())
             }
             Err(error) => Models::Error(error),
         };

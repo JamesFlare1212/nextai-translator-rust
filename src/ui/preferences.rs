@@ -11,7 +11,11 @@ use gpui_kit::component::{FocusableExt, Theme, ThemeMode, switch::Switch};
 
 type Menu = Entity<SelectState<Vec<&'static str>>>;
 const MODES: [&str; 3] = ["跟随系统", "浅色", "深色"];
-const PROTOCOLS: [&str; 2] = ["Chat Completions", "Responses"];
+const PROTOCOLS: [&str; 3] = [
+    "Chat Completions（SSE）",
+    "Responses（SSE）",
+    "Responses（WebSocket）",
+];
 
 fn menu(items: Vec<&'static str>, value: &str, window: &mut Window, cx: &mut App) -> Menu {
     let index = items.iter().position(|&it| it == value).unwrap_or_default();
@@ -30,6 +34,7 @@ fn protocol_name(mode: ApiMode) -> &'static str {
     match mode {
         ApiMode::ChatCompletions => PROTOCOLS[0],
         ApiMode::Responses => PROTOCOLS[1],
+        ApiMode::ResponsesWs => PROTOCOLS[2],
     }
 }
 
@@ -48,12 +53,14 @@ pub(super) fn apply(mode: Appearance, window: &mut Window, cx: &mut App) {
 
 pub(super) struct OptionsForm {
     provider: Menu,
+    pub(super) drafts: config::Profiles,
     protocol: Menu,
     reasoning: bool,
     model: ModelPicker,
     models: Option<ModelLookup>,
     theme: Menu,
     target: Picker,
+    source: Picker,
     fonts: super::typography::FontControls,
 }
 
@@ -87,23 +94,17 @@ impl OptionsForm {
                 let SelectEvent::Confirm(Some(name)) = event else {
                     return;
                 };
-                let preset = PROVIDERS.iter().find(|p| p.name == *name);
-                let url = preset.map_or("", |p| p.endpoint);
-                if url != this.endpoint.read(cx).value().as_ref() {
-                    this.form.cancel_models();
-                    this.api_key.update(cx, |s, cx| s.set_value("", w, cx));
-                    this.endpoint.update(cx, |s, cx| s.set_value(url, w, cx));
-                    this.form.model.reset(preset.map_or("", |p| p.model), w, cx);
-                }
-                cx.notify();
+                this.switch_provider(name, w, cx);
             },
         )
         .detach();
         cx.observe_in(&protocol, window, |this, _, w, cx| {
-            this.discard_stale_models(w, cx)
+            this.discard_stale_models(w, cx);
+            cx.notify();
         })
         .detach();
         Self {
+            drafts: Default::default(),
             provider,
             protocol,
             reasoning: settings.reasoning,
@@ -111,6 +112,7 @@ impl OptionsForm {
             models: None,
             theme,
             target,
+            source: picker(false, window, cx),
             fonts,
         }
     }
@@ -124,7 +126,9 @@ impl OptionsForm {
     }
 
     pub(super) fn api_mode(&self, cx: &App) -> ApiMode {
-        if self.protocol.read(cx).selected_value() == Some(&PROTOCOLS[1]) {
+        if self.protocol.read(cx).selected_value() == Some(&PROTOCOLS[2]) {
+            ApiMode::ResponsesWs
+        } else if self.protocol.read(cx).selected_value() == Some(&PROTOCOLS[1]) {
             ApiMode::Responses
         } else {
             ApiMode::ChatCompletions
@@ -139,14 +143,23 @@ impl OptionsForm {
         &mut self,
         settings: &Settings,
         prefs: &Preferences,
+        profiles: &config::Profiles,
         window: &mut Window,
         cx: &mut App,
     ) {
+        self.drafts = profiles.clone();
+        let active = PROVIDERS
+            .iter()
+            .map(|p| p.name)
+            .chain([CUSTOM])
+            .find(|name| *name == profiles.active)
+            .unwrap_or_else(|| provider::identify(&settings.endpoint));
+        self.drafts.active = active.into();
         self.cancel_models();
         self.model.reset(&settings.model, window, cx);
         self.reasoning = settings.reasoning;
         for (select, label) in [
-            (&self.provider, provider::identify(&settings.endpoint)),
+            (&self.provider, active),
             (&self.protocol, protocol_name(settings.api_mode)),
             (&self.theme, mode_name(prefs.appearance)),
         ] {
@@ -155,6 +168,12 @@ impl OptionsForm {
         select(
             &self.target,
             language(&prefs.target).map_or(CHINESE, |l| l.0),
+            window,
+            cx,
+        );
+        select(
+            &self.source,
+            language(&prefs.source).map_or(ENGLISH, |l| l.0),
             window,
             cx,
         );
@@ -169,6 +188,13 @@ impl OptionsForm {
         };
         let mut prefs = Preferences {
             appearance,
+            source: self
+                .source
+                .read(cx)
+                .selected_value()
+                .copied()
+                .unwrap_or(ENGLISH)
+                .into(),
             target: self
                 .target
                 .read(cx)
@@ -203,6 +229,91 @@ fn menu_field(name: &'static str, state: &Menu) -> Div {
 }
 
 impl Translator {
+    fn switch_provider(&mut self, name: &str, w: &mut Window, cx: &mut Context<Self>) {
+        if self.form.drafts.active == name {
+            return;
+        }
+        let current = self.draft(cx);
+        let drafts = &mut self.form.drafts;
+        drafts.others.insert(
+            std::mem::replace(&mut drafts.active, name.to_string()),
+            current,
+        );
+        let next = drafts.others.remove(name).unwrap_or_else(|| {
+            let preset = PROVIDERS.iter().find(|p| p.name == name);
+            Settings {
+                endpoint: preset.map_or("", |p| p.endpoint).into(),
+                model: preset.map_or("", |p| p.model).into(),
+                ..Default::default()
+            }
+        });
+        self.form.cancel_models();
+        self.endpoint
+            .update(cx, |s, cx| s.set_value(next.endpoint, w, cx));
+        self.api_key
+            .update(cx, |s, cx| s.set_value(next.api_key, w, cx));
+        self.form.model.reset(&next.model, w, cx);
+        self.form.protocol.update(cx, |s, cx| {
+            s.set_selected_value(&protocol_name(next.api_mode), w, cx)
+        });
+        self.form.reasoning = next.reasoning;
+        self.notice = None;
+        cx.notify();
+    }
+
+    fn endpoint_input(&self, cx: &App) -> impl IntoElement {
+        let endpoint = self.endpoint.clone();
+        let mode = self.form.api_mode(cx);
+        div()
+            .size_full()
+            .relative()
+            .child(
+                Input::new(&endpoint)
+                    .focus_bordered(false)
+                    .aria_label("API 地址"),
+            )
+            .child(
+                canvas(
+                    |_, _, _| (),
+                    move |_, _, window, cx| {
+                        let state = endpoint.read(cx);
+                        let value = state.value();
+                        let Some(hint) = engine::endpoint_hint(&value, mode) else {
+                            return;
+                        };
+                        let end = value.len();
+                        let Some(caret) = state.range_to_bounds(&(end..end)) else {
+                            return;
+                        };
+                        let mask = ContentMask {
+                            bounds: state.input_bounds(),
+                        };
+                        let mut style = window.text_style();
+                        style.color = cx.theme().muted_foreground;
+                        let line = window.text_system().shape_line(
+                            hint.clone().into(),
+                            style.font_size.to_pixels(window.rem_size()),
+                            &[style.to_run(hint.len())],
+                            None,
+                        );
+                        window.with_content_mask(Some(mask), |w| {
+                            let _ = line.paint(
+                                caret.origin,
+                                caret.size.height,
+                                TextAlign::Left,
+                                None,
+                                w,
+                                cx,
+                            );
+                        });
+                    },
+                )
+                .absolute()
+                .inset_0()
+                .text_sm(),
+            )
+    }
+
     pub(super) fn render_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let row = || h_flex().w_full().items_start().gap(px(14.));
         v_flex()
@@ -224,12 +335,7 @@ impl Translator {
                                     .child(menu_field("默认服务提供商", &self.form.provider))
                                     .child(menu_field("API 协议", &self.form.protocol)),
                             )
-                            .child(field(
-                                "API 地址",
-                                Input::new(&self.endpoint)
-                                    .focus_bordered(false)
-                                    .aria_label("API 地址"),
-                            ))
+                            .child(field("API 地址", self.endpoint_input(cx)))
                             .child(field(
                                 "API 密钥",
                                 Input::new(&self.api_key)
@@ -251,6 +357,15 @@ impl Translator {
                             .child(
                                 row()
                                     .child(field(
+                                        "默认来源语言",
+                                        Select::new(&self.form.source)
+                                            .w_full()
+                                            .focus_ring(false)
+                                            .menu_max_h(px(230.))
+                                            .search_placeholder("搜索语言")
+                                            .accessibility_label("默认来源语言"),
+                                    ))
+                                    .child(field(
                                         "默认目标语言",
                                         Select::new(&self.form.target)
                                             .w_full()
@@ -258,9 +373,9 @@ impl Translator {
                                             .menu_max_h(px(230.))
                                             .search_placeholder("搜索语言")
                                             .accessibility_label("默认目标语言"),
-                                    ))
-                                    .child(menu_field("外观", &self.form.theme)),
+                                    )),
                             )
+                            .child(menu_field("外观", &self.form.theme))
                             .child(self.form.fonts.render()),
                     ),
             )

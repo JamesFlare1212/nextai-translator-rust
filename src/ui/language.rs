@@ -112,7 +112,12 @@ pub(super) fn language(name: &str) -> Option<Language> {
 }
 
 pub(super) fn detect(text: &str) -> Option<&'static str> {
-    let sample: String = text.chars().take(4096).collect();
+    let bounded: String = text.chars().take(4096).collect();
+    let sample = bounded
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("{{<"))
+        .collect::<Vec<_>>()
+        .join(" ");
     let kana = |c| matches!(c, '\u{3040}'..='\u{30ff}');
     let hangul = |c| matches!(c, '\u{ac00}'..='\u{d7a3}' | '\u{1100}'..='\u{11ff}');
     if sample.chars().any(kana) {
@@ -121,14 +126,22 @@ pub(super) fn detect(text: &str) -> Option<&'static str> {
     if sample.chars().any(hangul) {
         return Some("Korean");
     }
-    let info = whatlang::detect(&sample)?;
-    if info.lang().code() == "cmn" {
+    let han = sample
+        .chars()
+        .filter(|c| matches!(c, '\u{3400}'..='\u{9fff}'))
+        .count();
+    let info = whatlang::detect(&sample);
+    if han > 0
+        && (han * 2 >= sample.chars().filter(|c| c.is_alphabetic()).count()
+            || info.as_ref().is_some_and(|i| i.lang().code() == "cmn"))
+    {
         return Some(if han_score(&sample) > 0 {
             "Traditional Chinese"
         } else {
             CHINESE
         });
     }
+    let info = info?;
     if !info.is_reliable() {
         let common_english = sample.split(|c: char| !c.is_ascii_alphabetic()).any(|w| {
             matches!(
@@ -156,13 +169,19 @@ fn han_score(s: &str) -> i32 {
     s.chars().filter_map(|c| VARIANTS.get(&c)).sum()
 }
 
-pub(super) fn automatic_target(source: Option<&str>, preferred: &'static str) -> &'static str {
-    if matches!(
-        source,
-        Some("Simplified Chinese" | "Traditional Chinese" | "Classical Chinese")
-    ) || source == Some(preferred)
-    {
-        ENGLISH
+pub(super) fn automatic_target(
+    source: Option<&str>,
+    preferred: &'static str,
+    reverse: &'static str,
+) -> &'static str {
+    let chinese = |s: &str| {
+        matches!(
+            s,
+            "Simplified Chinese" | "Traditional Chinese" | "Classical Chinese"
+        )
+    };
+    if source.is_some_and(|s| s == preferred || (chinese(s) && chinese(preferred))) {
+        reverse
     } else {
         preferred
     }

@@ -82,6 +82,43 @@ fn theme_switch_keeps_the_focus_cue_on_the_existing_border(cx: &mut TestAppConte
 }
 
 #[gpui_kit::test]
+fn language_menu_surface_follows_the_inset_of_the_selected_row(cx: &mut TestAppContext) {
+    use gpui_kit::component::ActiveTheme;
+    let (handle, view) = open_test_window(cx);
+    cx.update_window(handle, |_, w, cx| {
+        w.render_frame(cx);
+        let id = view.read(cx).source.entity_id();
+        w.within(("select", id)).click("input", cx);
+    })
+    .unwrap();
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(250));
+    cx.update_window(handle, |_, w, cx| {
+        w.render_frame(cx);
+        let scale = w.scale_factor();
+        let quads = w.painted_quads();
+        let surface = quads
+            .iter()
+            .find(|q| q.bounds.size.width.0 == 196. * scale && q.corner_radii.bottom_left.0 > 0.)
+            .expect("language popup surface");
+        let row = quads
+            .iter()
+            .find(|q| {
+                q.bounds.size.width.0 == 188. * scale
+                    && q.corner_radii.bottom_left == cx.theme().radius.scale(scale)
+            })
+            .expect("highlighted language row");
+        let inset = row.bounds.left().0 - surface.bounds.left().0;
+        assert_eq!(inset, 4. * scale);
+        assert_eq!(
+            surface.corner_radii.bottom_left.0,
+            row.corner_radii.bottom_left.0 + inset
+        );
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
 fn restored_pair_can_be_copied_without_a_network_request(cx: &mut TestAppContext) {
     let (handle, view) = open_test_window(cx);
     cx.update_window(handle, |_, w, cx| {
@@ -100,7 +137,9 @@ fn restored_pair_can_be_copied_without_a_network_request(cx: &mut TestAppContext
         for (button, expected) in [
             ("copy-source", "The train is here."),
             ("copy-target", "列车到了。"),
+            ("copy-target", "列车到了。"),
         ] {
+            cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string("其他内容".into()));
             w.click(button, cx);
             assert_eq!(
                 cx.read_from_clipboard()

@@ -1,12 +1,14 @@
+mod catalog;
 #[path = "engine/responses.rs"]
 mod responses;
+mod websocket;
+use catalog::parse_models;
 
 use reqwest::{Client, RequestBuilder, Response, Url};
 use responses::Responses;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
-    collections::HashSet,
     net::IpAddr,
     sync::atomic::{AtomicBool, Ordering},
     time::Duration,
@@ -31,13 +33,14 @@ pub enum ApiMode {
     #[default]
     ChatCompletions,
     Responses,
+    ResponsesWs,
 }
 
 impl ApiMode {
     fn path(self) -> &'static str {
         match self {
             Self::ChatCompletions => "chat/completions",
-            Self::Responses => "responses",
+            Self::Responses | Self::ResponsesWs => "responses",
         }
     }
 }
@@ -88,7 +91,30 @@ fn api_url(settings: &Settings, route: &str) -> Result<Url, String> {
     {
         return Err("API 密钥含有空格或无效字符。".into());
     }
-    let mut url = Url::parse(settings.endpoint.trim()).map_err(|_| "请输入有效的 API 地址。")?;
+    resolve_url(&settings.endpoint, route)
+}
+
+pub fn endpoint_hint(endpoint: &str, mode: ApiMode) -> Option<String> {
+    let url = resolve_url(endpoint, mode.path()).ok()?;
+    let original = Url::parse(endpoint.trim()).ok()?;
+    if original == url {
+        return None;
+    }
+    if original.query().is_none() {
+        let path = if original.path() == "/" && !endpoint.trim().ends_with('/') {
+            ""
+        } else {
+            original.path()
+        };
+        if let Some(suffix) = url.path().strip_prefix(path) {
+            return Some(suffix.into());
+        }
+    }
+    Some(format!(" → {}", url.path()))
+}
+
+fn resolve_url(endpoint: &str, route: &str) -> Result<Url, String> {
+    let mut url = Url::parse(endpoint.trim()).map_err(|_| "请输入有效的 API 地址。")?;
     if url.host_str().is_none() {
         return Err("API 地址缺少主机名。".into());
     }
@@ -155,13 +181,123 @@ fn check_cancel(cancel: &AtomicBool) -> Result<(), String> {
     }
 }
 
+#[cfg(test)]
 pub fn translate(
     settings: &Settings,
     source: &str,
     target: &str,
     text: &str,
     cancel: &AtomicBool,
+    on_delta: impl FnMut(&str),
+) -> Result<(), String> {
+    translate_attempt(
+        settings,
+        source,
+        target,
+        text,
+        cancel,
+        on_delta,
+        &mut Recovery::None,
+    )
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Recovery {
+    None,
+    Interrupted,
+    NoWsRoute,
+}
+
+pub enum StreamUpdate<'a> {
+    UsingSse,
+    Retrying,
+    Replace(&'a str),
+    Append(&'a str),
+}
+
+pub fn translate_with_recovery(
+    settings: &Settings,
+    source: &str,
+    target: &str,
+    text: &str,
+    cancel: &AtomicBool,
+    mut update: impl FnMut(StreamUpdate<'_>),
+) -> Result<(), String> {
+    let mut recovery = Recovery::None;
+    let first = translate_attempt(
+        settings,
+        source,
+        target,
+        text,
+        cancel,
+        |s| update(StreamUpdate::Append(s)),
+        &mut recovery,
+    );
+    if recovery == Recovery::None || first.is_ok() {
+        return first;
+    }
+    check_cancel(cancel)?;
+    if recovery == Recovery::NoWsRoute {
+        update(StreamUpdate::UsingSse);
+        let fallback = Settings {
+            api_mode: ApiMode::Responses,
+            ..settings.clone()
+        };
+        return translate_attempt(
+            &fallback,
+            source,
+            target,
+            text,
+            cancel,
+            |s| update(StreamUpdate::Append(s)),
+            &mut Recovery::None,
+        )
+        .map_err(|err| {
+            if cancel.load(Ordering::Acquire) {
+                err
+            } else {
+                format!("WebSocket 无可用模型渠道（503/model_not_found），改用 SSE 后仍失败：{err}")
+            }
+        });
+    }
+    update(StreamUpdate::Retrying);
+    for _ in 0..10 {
+        check_cancel(cancel)?;
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let mut replace = true;
+    translate_attempt(
+        settings,
+        source,
+        target,
+        text,
+        cancel,
+        |s| {
+            update(if std::mem::take(&mut replace) {
+                StreamUpdate::Replace(s)
+            } else {
+                StreamUpdate::Append(s)
+            });
+        },
+        &mut Recovery::None,
+    )
+    .map_err(|err| {
+        if cancel.load(std::sync::atomic::Ordering::Acquire) {
+            err
+        } else {
+            format!("自动重试未完成：{err}")
+        }
+    })
+}
+
+fn translate_attempt(
+    settings: &Settings,
+    source: &str,
+    target: &str,
+    text: &str,
+    cancel: &AtomicBool,
     mut on_delta: impl FnMut(&str),
+    recovery: &mut Recovery,
 ) -> Result<(), String> {
     check_cancel(cancel)?;
     let url = validated_url(settings)?;
@@ -178,14 +314,6 @@ pub fn translate(
     let runtime = network_runtime()?;
     let result = runtime.block_on(async {
         let mut request = std::pin::pin!(async {
-            let post = client(&url, Duration::from_secs(180))?
-                .post(url)
-                .header(
-                    reqwest::header::ACCEPT,
-                    "text/event-stream, application/json",
-                )
-                .json(&body);
-            let mut response = send(post, settings).await?;
             let mut answer = Answer {
                 api_mode: settings.api_mode,
                 responses: Responses::default(),
@@ -193,11 +321,29 @@ pub fn translate(
                 cancel,
                 on_delta: &mut on_delta,
             };
+            if settings.api_mode == ApiMode::ResponsesWs {
+                return websocket::translate(url, settings, body, &mut answer, recovery).await;
+            }
+            let post = client(&url, None)?
+                .post(url)
+                .header(
+                    reqwest::header::ACCEPT,
+                    "text/event-stream, application/json",
+                )
+                .json(&body);
+            let mut response = send(post, settings).await?;
             let mut stream = Sse::default();
             let mut is_json = None;
             let mut document = Vec::new();
             let mut size = 0;
-            while let Some(chunk) = response.chunk().await.map_err(network_error)? {
+            while let Some(chunk) = response.chunk().await.map_err(|error| {
+                *recovery = Recovery::Interrupted;
+                if error.is_timeout() {
+                    "译文流长时间没有响应。".into()
+                } else {
+                    INCOMPLETE.to_string()
+                }
+            })? {
                 check_cancel(cancel)?;
                 if chunk.len() > MAX_RESPONSE - size {
                     return Err(TOO_LARGE.into());
@@ -219,6 +365,7 @@ pub fn translate(
                 answer.decode(&document, None)?;
                 answer.complete()
             } else {
+                *recovery = Recovery::Interrupted;
                 Err(INCOMPLETE.into())
             }
         });
@@ -246,7 +393,7 @@ fn translation_body(
         ApiMode::ChatCompletions => json!({ "model": model, "stream": true, "messages": [
             { "role": "system", "content": prompt }, { "role": "user", "content": text }
         ] }),
-        ApiMode::Responses => {
+        ApiMode::Responses | ApiMode::ResponsesWs => {
             json!({ "model": model, "stream": true, "instructions": prompt, "input": text })
         }
     };
@@ -259,7 +406,7 @@ fn translation_body(
     };
     match settings.api_mode {
         ApiMode::ChatCompletions => body["reasoning_effort"] = json!(effort),
-        ApiMode::Responses => body["reasoning"] = json!({"effort": effort}),
+        ApiMode::Responses | ApiMode::ResponsesWs => body["reasoning"] = json!({"effort": effort}),
     }
     body
 }
@@ -288,12 +435,14 @@ fn network_runtime() -> Result<tokio::runtime::Runtime, String> {
         .map_err(|_| "无法启动网络线程。".into())
 }
 
-fn client(url: &Url, timeout: Duration) -> Result<Client, String> {
+fn client(url: &Url, timeout: Option<Duration>) -> Result<Client, String> {
     let mut builder = Client::builder()
         .connect_timeout(Duration::from_secs(10))
-        .read_timeout(Duration::from_secs(60))
-        .timeout(timeout)
+        .read_timeout(Duration::from_secs(120))
         .redirect(reqwest::redirect::Policy::none());
+    if let Some(timeout) = timeout {
+        builder = builder.timeout(timeout);
+    }
     if loopback(url) {
         builder = builder.no_proxy();
         if url.host_str() == Some("localhost") {
@@ -313,7 +462,24 @@ async fn send(mut request: RequestBuilder, settings: &Settings) -> Result<Respon
     if !settings.api_key.trim().is_empty() {
         request = request.bearer_auth(settings.api_key.trim());
     }
-    let response = request.send().await.map_err(network_error)?;
+    let retry = request.try_clone();
+    let first = request.send().await;
+    let retryable = match &first {
+        Err(e) => e.is_connect(),
+        Ok(r) => {
+            matches!(r.status().as_u16(), 502..=504)
+                && !r.headers().contains_key(reqwest::header::RETRY_AFTER)
+        }
+    };
+    let response = match retry {
+        Some(next) if retryable => {
+            drop(first);
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            next.send().await
+        }
+        _ => first,
+    }
+    .map_err(network_error)?;
     let status = response.status();
     if status.is_success() {
         return Ok(response);
@@ -322,6 +488,7 @@ async fn send(mut request: RequestBuilder, settings: &Settings) -> Result<Respon
         300..=399 => "不跟随重定向，请填写服务的最终地址。",
         401 | 403 => "请检查 API 密钥和模型访问权限。",
         404 => "请检查 API 地址和模型名称。",
+        502..=504 => "服务网关暂时不可用，请稍后重试。",
         429 => "请求过于频繁或额度不足，请检查配额后重试。",
         _ => "翻译服务拒绝了此次请求。",
     };
@@ -332,7 +499,7 @@ pub fn list_models(settings: &Settings) -> Result<Vec<String>, String> {
     let url = api_url(settings, "models")?;
     let runtime = network_runtime()?;
     let result = runtime.block_on(async {
-        let get = client(&url, Duration::from_secs(20))?
+        let get = client(&url, Some(Duration::from_secs(20)))?
             .get(url)
             .header(reqwest::header::ACCEPT, "application/json");
         let mut response = send(get, settings).await?;
@@ -347,32 +514,6 @@ pub fn list_models(settings: &Settings) -> Result<Vec<String>, String> {
     });
     runtime.shutdown_background();
     result
-}
-
-fn parse_models(bytes: &[u8]) -> Result<Vec<String>, String> {
-    #[derive(Deserialize)]
-    struct Models {
-        data: Option<Vec<Model>>,
-        error: Option<serde::de::IgnoredAny>,
-    }
-    #[derive(Deserialize)]
-    struct Model {
-        id: Option<String>,
-    }
-    let malformed = "服务返回的模型列表格式无效。";
-    let models: Models = serde_json::from_slice(bytes).map_err(|_| malformed)?;
-    if models.error.is_some() {
-        return Err(PROVIDER_ERROR.into());
-    }
-    let rows = models.data.ok_or(malformed)?;
-    let mut seen = HashSet::new();
-    Ok(rows
-        .iter()
-        .filter_map(|m| m.id.as_deref())
-        .map(str::trim)
-        .filter(|id| !id.is_empty() && !id.chars().any(char::is_control) && seen.insert(*id))
-        .map(str::to_owned)
-        .collect())
 }
 
 fn network_error(error: reqwest::Error) -> String {
@@ -437,7 +578,7 @@ impl<F: FnMut(&str)> Answer<'_, F> {
             }
             Ok(())
         };
-        if self.api_mode == ApiMode::Responses {
+        if self.api_mode != ApiMode::ChatCompletions {
             return self.responses.decode(bytes, event, emit);
         }
         let stream = event.is_some();

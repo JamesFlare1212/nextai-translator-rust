@@ -47,7 +47,7 @@ fn serve_catalog() -> (String, std::thread::JoinHandle<()>) {
                 .to_lowercase()
                 .contains("authorization: bearer test-replacement")
         );
-        let body = r#"{"data":[{"id":"from-server"},{"id":"other-choice"}]}"#;
+        let body = r#"{"data":[{"id":"from-server-illustrator","output_modalities":["image"]},{"id":"gpt-image-2.6-flare"},{"id":"from-server"},{"id":"other-choice"}]}"#;
         write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
     });
     (endpoint, task)
@@ -75,7 +75,11 @@ fn model_choices_track_the_current_settings_draft(cx: &mut TestAppContext) {
                     api_mode: ApiMode::Responses,
                     reasoning: true,
                 };
-                configured_view(window, cx, Ok((saved, Preferences::default())))
+                configured_view(
+                    window,
+                    cx,
+                    Ok((saved, Preferences::default(), Default::default())),
+                )
             },
         )
         .unwrap()
@@ -83,7 +87,22 @@ fn model_choices_track_the_current_settings_draft(cx: &mut TestAppContext) {
     cx.update_window(handle, |_, w, cx| {
         w.click("settings", cx);
         assert!(view.read(cx).form.models.is_none());
-        assert_eq!(view.read(cx).form.model_name(cx), "custom");
+        view.update(cx, |v, cx| {
+            v.switch_provider("DeepSeek", w, cx);
+            assert!(v.draft(cx).api_key.is_empty());
+            assert!(!v.draft(cx).reasoning);
+            v.form.model.reset("my-deepseek", w, cx);
+            v.switch_provider(crate::provider::CUSTOM, w, cx);
+            let restored = v.draft(cx);
+            assert_eq!(restored.endpoint, "http://127.0.0.1:1/v1");
+            assert!(restored.api_key == "test-original");
+            assert_eq!(restored.model, "custom");
+            assert_eq!(restored.api_mode, ApiMode::Responses);
+            assert!(restored.reasoning);
+            v.switch_provider("DeepSeek", w, cx);
+            assert_eq!(v.draft(cx).model, "my-deepseek");
+            v.switch_provider(crate::provider::CUSTOM, w, cx);
+        });
         assert!(w.find("model-picker").bounds().size.width > px(450.));
         assert!(
             w.find("refresh-models").bounds().left() >= w.find("model-picker").bounds().right()

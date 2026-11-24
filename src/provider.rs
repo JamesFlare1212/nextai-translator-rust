@@ -6,11 +6,6 @@ pub struct Provider {
 
 pub const PROVIDERS: &[Provider] = &[
     Provider {
-        name: "New API",
-        endpoint: "https://new-api.jamesflare.com",
-        model: "gpt-6-luna",
-    },
-    Provider {
         name: "OpenAI",
         endpoint: "https://api.openai.com/v1/chat/completions",
         model: "gpt-4o-mini",
@@ -29,11 +24,6 @@ pub const PROVIDERS: &[Provider] = &[
         name: "Gemini",
         endpoint: "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
         model: "gemini-2.5-flash",
-    },
-    Provider {
-        name: "OpenRouter",
-        endpoint: "https://openrouter.ai/api/v1/chat/completions",
-        model: "openai/gpt-4o-mini",
     },
     Provider {
         name: "Groq",

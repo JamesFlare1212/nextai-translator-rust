@@ -104,6 +104,9 @@ struct Request {
 }
 
 enum Message {
+    UsingSse,
+    Retrying,
+    Replace(String),
     Delta(String),
     Finished(Result<(), String>),
 }
@@ -117,12 +120,15 @@ pub struct Translator {
     manual_target: bool,
     auto_source: bool,
     preferences: config::Preferences,
+    profiles: config::Profiles,
     form: preferences::OptionsForm,
     status: Status,
     request: Option<Request>,
     output: String,
     cancel: Option<Arc<AtomicBool>>,
     pump: Option<Task<()>>,
+    retrying: bool,
+    using_sse_fallback: bool,
     settings: Settings,
     endpoint: Entity<InputState>,
     api_key: Entity<InputState>,
@@ -138,7 +144,7 @@ pub fn view(window: &mut Window, cx: &mut App) -> Entity<Translator> {
 fn configured_view(
     window: &mut Window,
     cx: &mut App,
-    loaded: Result<(Settings, config::Preferences), String>,
+    loaded: Result<(Settings, config::Preferences, config::Profiles), String>,
 ) -> Entity<Translator> {
     gpui_kit::component::set_locale("zh-CN");
     cx.bind_keys([
@@ -160,9 +166,9 @@ impl Translator {
     fn new(
         window: &mut Window,
         cx: &mut Context<Self>,
-        loaded: Result<(Settings, config::Preferences), String>,
+        loaded: Result<(Settings, config::Preferences, config::Profiles), String>,
     ) -> Self {
-        let ((settings, preferences), notice) = match loaded {
+        let ((settings, preferences, profiles), notice) = match loaded {
             Ok(s) => (s, None),
             Err(e) => (Default::default(), Some(e)),
         };
@@ -186,7 +192,7 @@ impl Translator {
             cx,
         );
         let mut form = preferences::OptionsForm::new(&settings, &preferences, window, cx);
-        form.reset(&settings, &preferences, window, cx);
+        form.reset(&settings, &preferences, &profiles, window, cx);
         preferences::apply(preferences.appearance, window, cx);
         typography::apply(&preferences, cx);
         cx.observe_window_appearance(window, |this, w, cx| {
@@ -254,11 +260,14 @@ impl Translator {
             auto_source: true,
             form,
             preferences,
+            profiles,
             status: Status::Idle,
             request: None,
             output: String::new(),
             cancel: None,
             pump: None,
+            retrying: false,
+            using_sse_fallback: false,
             endpoint,
             api_key,
             settings,
@@ -278,6 +287,8 @@ impl Translator {
     fn reset(&mut self) {
         self.abort();
         self.status = Status::Idle;
+        self.retrying = false;
+        self.using_sse_fallback = false;
         self.output.clear();
         self.request = None;
         self.notice = None;
@@ -328,6 +339,7 @@ impl Translator {
             let target = automatic_target(
                 detected,
                 language(&self.preferences.target).map_or(CHINESE, |l| l.0),
+                language(&self.preferences.source).map_or(ENGLISH, |l| l.0),
             );
             select(&self.target, target, window, cx);
             target
@@ -360,15 +372,20 @@ impl Translator {
         let worker = std::thread::Builder::new()
             .name("translation".into())
             .spawn(move || {
-                let result = engine::translate(
+                let result = engine::translate_with_recovery(
                     &settings,
                     request.source,
                     request.target,
                     &request.text,
                     &flag,
-                    |delta| {
-                        if !delta.is_empty() && !flag.load(Ordering::Acquire) {
-                            let _ = tx.send(Message::Delta(delta.to_owned()));
+                    |update| {
+                        if !flag.load(Ordering::Acquire) {
+                            let _ = tx.send(match update {
+                                engine::StreamUpdate::Append(s) => Message::Delta(s.to_owned()),
+                                engine::StreamUpdate::Replace(s) => Message::Replace(s.to_owned()),
+                                engine::StreamUpdate::UsingSse => Message::UsingSse,
+                                engine::StreamUpdate::Retrying => Message::Retrying,
+                            });
                         }
                     },
                 );
@@ -384,8 +401,18 @@ impl Translator {
             loop {
                 let mut delta = String::new();
                 let mut end = None;
+                let mut retrying = None;
+                let mut using_sse = false;
+                let mut replace = false;
                 for _ in 0..256 {
                     match rx.try_recv() {
+                        Ok(Message::UsingSse) => using_sse = true,
+                        Ok(Message::Retrying) => retrying = Some(true),
+                        Ok(Message::Replace(chunk)) => {
+                            replace = true;
+                            retrying = Some(false);
+                            delta = chunk;
+                        }
                         Ok(Message::Delta(chunk)) => delta.push_str(&chunk),
                         Ok(Message::Finished(result)) => {
                             end = Some(result);
@@ -399,9 +426,16 @@ impl Translator {
                     }
                 }
                 let finished = end.is_some();
-                if (!delta.is_empty() || finished)
+                if (!delta.is_empty() || finished || retrying.is_some() || using_sse)
                     && this
                         .update(cx, |this, cx| {
+                            this.using_sse_fallback |= using_sse;
+                            if replace {
+                                this.output.clear();
+                            }
+                            if let Some(retrying) = retrying {
+                                this.retrying = retrying;
+                            }
                             this.output.push_str(&delta);
                             if let Some(result) = end {
                                 this.finish(result);
@@ -465,11 +499,11 @@ impl Translator {
         let reverse = if old_source != AUTO.0 {
             Some(old_source)
         } else if text.trim().is_empty() {
-            Some(if old_target == ENGLISH {
-                CHINESE
-            } else {
-                ENGLISH
-            })
+            Some(automatic_target(
+                Some(old_target),
+                language(&self.preferences.target).map_or(CHINESE, |l| l.0),
+                language(&self.preferences.source).map_or(ENGLISH, |l| l.0),
+            ))
         } else if translated_current {
             self.request.as_ref().and_then(|r| r.detected)
         } else {
@@ -504,31 +538,69 @@ impl Translator {
         ] {
             field.update(cx, |s, cx| s.set_value(value.clone(), window, cx));
         }
-        self.form
-            .reset(&self.settings, &self.preferences, window, cx);
+        self.form.reset(
+            &self.settings,
+            &self.preferences,
+            &self.profiles,
+            window,
+            cx,
+        );
         self.page = Page::Settings;
         self.notice = None;
         self.endpoint.focus_handle(cx).focus(window, cx);
         cx.notify();
     }
 
-    fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let settings = Settings {
+    fn draft(&self, cx: &App) -> Settings {
+        Settings {
             endpoint: self.endpoint.read(cx).value().trim().into(),
             model: self.form.model_name(cx),
             api_key: self.api_key.read(cx).value().trim().into(),
             api_mode: self.form.api_mode(cx),
             reasoning: self.form.reasoning(),
+        }
+    }
+
+    fn check_origin(&self, draft: &Settings) -> Result<(), String> {
+        let mut matching = std::iter::once(&self.settings)
+            .chain(self.profiles.others.values())
+            .filter(|s| {
+                !draft.api_key.trim().is_empty() && s.api_key.trim() == draft.api_key.trim()
+            });
+        let Some(first) = matching.next() else {
+            return Ok(());
         };
+        if matching.any(|s| preferences::validate_draft_origin(s, draft).is_ok()) {
+            return Ok(());
+        }
+        preferences::validate_draft_origin(first, draft)
+    }
+
+    fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let settings = self.draft(cx);
         let prefs = self.form.preferences(cx);
-        if let Err(e) = preferences::validate_draft_origin(&self.settings, &settings) {
+        if prefs.source == prefs.target {
+            self.notice = Some("默认来源语言和目标语言不能相同。".into());
+            cx.notify();
+            return;
+        }
+        let profiles = &self.form.drafts;
+        if let Err(e) = self.check_origin(&settings).and_then(|_| {
+            profiles
+                .others
+                .values()
+                .try_for_each(|s| self.check_origin(s))
+        }) {
             self.notice = Some(e);
             cx.notify();
             return;
         }
-        match config::save(&settings, &prefs) {
+        match config::save(&settings, &prefs, profiles) {
             Ok(()) => {
-                if prefs.target != self.preferences.target {
+                self.profiles = profiles.clone();
+                if prefs.target != self.preferences.target
+                    || prefs.source != self.preferences.source
+                {
                     self.manual_target = false;
                     select(
                         &self.target,
@@ -726,6 +798,11 @@ impl Translator {
     fn render_result(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let (label, icon) = match self.status {
             Status::Idle => ("", None),
+            Status::Running if self.using_sse_fallback => ("WebSocket 无可用渠道，改用 SSE", None),
+            Status::Done if self.using_sse_fallback => {
+                ("已翻译（SSE 回退）", Some(IconName::Check))
+            }
+            Status::Running if self.retrying => ("正在自动重试", None),
             Status::Running => ("正在翻译", None),
             Status::Done => ("已翻译", Some(IconName::Check)),
             Status::Stopped => ("已停止", Some(IconName::Square)),
@@ -1085,11 +1162,11 @@ mod tests {
             );
         }
         assert_eq!(
-            automatic_target(detect("这是用于检测语言的中文句子。"), CHINESE),
+            automatic_target(detect("这是用于检测语言的中文句子。"), CHINESE, ENGLISH),
             ENGLISH
         );
         assert_eq!(
-            automatic_target(detect("これは日本語です。"), CHINESE),
+            automatic_target(detect("これは日本語です。"), CHINESE, ENGLISH),
             CHINESE
         );
         assert_eq!(detect("안녕하세요"), Some("Korean"));
@@ -1097,8 +1174,14 @@ mod tests {
             detect("這是用於檢測語言的繁體中文句子。"),
             Some("Traditional Chinese")
         );
+        let mixed = "## 我是谁？\n我叫 James，是一名电气工程专业的学生。我喜欢开源项目。\n{{< gh-repo-card repo=\"JamesFlare1212/FlareBlog\" >}}";
+        assert_eq!(automatic_target(detect(mixed), CHINESE, "French"), "French");
+        assert_eq!(automatic_target(Some(ENGLISH), ENGLISH, CHINESE), CHINESE);
         assert_eq!(detect(""), None);
         assert_eq!(detect("The cat is sleeping on the chair."), Some(ENGLISH));
-        assert_eq!(automatic_target(Some("Spanish"), "German"), "German");
+        assert_eq!(
+            automatic_target(Some("Spanish"), "German", ENGLISH),
+            "German"
+        );
     }
 }
