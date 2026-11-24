@@ -52,3 +52,43 @@ jobs:
           name: nextai-translator-windows-x64
           path: dist/
           if-no-files-found: error
+      - name: Build and smoke-test portable and setup
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $v = (cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
+          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -cne "v$v") { throw 'Release tag must match Cargo.toml' }
+          $exe = 'target/x86_64-pc-windows-msvc/release/nextai-translator.exe'
+          if ((Get-Item $exe).VersionInfo.FileDescription -cne 'NextAI Translator') { throw 'Missing file description' }
+          ./packaging/build.ps1 -Version $v -Executable $exe -OutputDir release-assets
+          ./packaging/test-portable.ps1
+          $dir = Join-Path $env:RUNNER_TEMP 'NextAI setup test'
+          $setup = Get-Item "release-assets/*-setup.exe"
+          $p = Start-Process $setup.FullName -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /DIR=`"$dir`"" -Wait -PassThru
+          if ($p.ExitCode -or !(Test-Path "$dir/nextai-setup.marker") -or (Get-FileHash "$dir/nextai-translator.exe").Hash -ne (Get-FileHash $exe).Hash) { throw 'Installation failed' }
+          $p = Start-Process "$dir/unins000.exe" -ArgumentList '/VERYSILENT /NORESTART' -Wait -PassThru
+          if ($p.ExitCode -or (Test-Path "$dir/nextai-translator.exe")) { throw 'Uninstall failed' }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-release-assets
+          path: release-assets/*.exe
+          if-no-files-found: error
+
+  publish:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: windows
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-release-assets
+          path: release-assets
+      - name: Publish stable release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 1
+          gh release create "$GITHUB_REF_NAME" release-assets/*.exe --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes --title "$GITHUB_REF_NAME" --draft
+          gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false

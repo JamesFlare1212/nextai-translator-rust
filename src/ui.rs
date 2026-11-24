@@ -1,6 +1,7 @@
 mod language;
 mod preferences;
 mod typography;
+mod updates;
 use language::{AUTO, CHINESE, ENGLISH, LANGUAGES, Language, automatic_target, detect, language};
 
 use crate::{
@@ -135,10 +136,14 @@ pub struct Translator {
     notice: Option<String>,
     entries: Vec<Entry>,
     confirming_clear: bool,
+    update: updates::State,
+    package: crate::updater::Kind,
 }
 
 pub fn view(window: &mut Window, cx: &mut App) -> Entity<Translator> {
-    configured_view(window, cx, config::load())
+    let view = configured_view(window, cx, config::load());
+    view.update(cx, |this, cx| this.check_update(cx));
+    view
 }
 
 fn configured_view(
@@ -274,6 +279,8 @@ impl Translator {
             notice,
             entries: Vec::new(),
             confirming_clear: false,
+            update: updates::State::Idle,
+            package: crate::updater::Kind::current(),
         }
     }
 
@@ -913,6 +920,15 @@ impl Translator {
                         .text_color(cx.theme().muted_foreground)
                         .child(format!("Powered by  {}", self.settings.model)),
                 )
+                .child(div().when(self.update.actionable(), |el| {
+                    el.child(
+                        Button::new("update-notice")
+                            .ghost()
+                            .small()
+                            .label("软件更新")
+                            .on_click(cx.listener(|this, _, w, cx| this.show_settings(w, cx))),
+                    )
+                }))
                 .child(
                     icon_button("history", IconName::RotateCcwClock, "翻译历史")
                         .on_click(cx.listener(|this, _, w, cx| this.show_history(w, cx))),

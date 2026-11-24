@@ -39,6 +39,32 @@ fn compose_clear_and_cancel_settings_at_minimum_size(cx: &mut TestAppContext) {
     .unwrap();
 }
 
+#[gpui_kit::test]
+fn update_status_stays_visible_at_minimum_size(cx: &mut TestAppContext) {
+    use super::updates::State;
+    let (handle, view) = open_test_window(cx);
+    cx.update_window(handle, |_, w, cx| {
+        w.render_frame(cx);
+        w.click("settings", cx);
+        for state in [
+            State::Checking,
+            State::Downloading,
+            State::Failed("无法连接 GitHub，请检查网络".into()),
+            State::Current,
+        ] {
+            view.update(cx, |v, cx| {
+                v.update = state;
+                cx.notify();
+            });
+            w.render_frame(cx);
+            let action = w.find("software-update");
+            assert!(action.visible());
+            assert!(action.bounds().right() <= px(540.));
+        }
+    })
+    .unwrap();
+}
+
 fn open_test_window(
     cx: &mut TestAppContext,
 ) -> (

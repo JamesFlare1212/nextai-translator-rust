@@ -10,6 +10,7 @@ mod history;
 mod live_tests;
 mod provider;
 mod ui;
+mod updater;
 
 use gpui_kit::{base::Root, *};
 

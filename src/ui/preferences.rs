@@ -330,6 +330,7 @@ impl Translator {
                         v_flex()
                             .p(px(24.))
                             .gap(px(16.))
+                            .child(self.update_panel(cx))
                             .child(
                                 row()
                                     .child(menu_field("默认服务提供商", &self.form.provider))

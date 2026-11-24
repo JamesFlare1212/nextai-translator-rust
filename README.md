@@ -4,6 +4,14 @@
 
 ![Windows 实机翻译窗口](docs/translator-dark.png)
 
+## 安装与更新
+
+从 [GitHub Releases](https://github.com/JamesFlare1212/nextai-translator-rust/releases/latest) 选择 Windows x64 版本：`*-portable.exe` 是单文件版，放在自己有写权限的目录；`*-setup.exe` 安装到当前用户目录，提供开始菜单入口和卸载程序。两种版本都沿用下文的 AppData 设置和历史位置。
+
+启动时后台检查 GitHub 最新稳定版，不向 GitHub 发送翻译或 API 密钥。有更新时，点底栏「软件更新」，或在设置顶部手动检查。点「下载更新」会下载与当前安装方式匹配的包，核对大小和 GitHub 发布资产的 SHA-256；点「重启并更新」才会关闭应用。便携版替换原路径的 EXE，安装版运行同目录升级。重启前请保存设置和所需草稿；尚未带有更新器的旧版需要手动升级一次。
+
+[更新界面交互预览](docs/update-preview.html)可在浏览器本地打开，版本号和包大小为示例。
+
 ## 开始翻译
 
 1. 运行 `nextai-translator.exe`。点左下角齿轮（`Ctrl+,`），默认服务是 `https://new-api.jamesflare.com`，模型为 `gpt-6-luna`。New API 和 OpenRouter 使用「自定义（OpenAI 兼容）」，升级时保留现有地址和密钥。切换提供商会保留各自的地址、密钥、模型、协议和思考开关；点「保存」后重启仍然有效，点「返回」则放弃本次修改。填写密钥并选择 API 协议。在「模型」下拉框中选择模型，或输入自定义名称并选中「使用…」，再点「保存」。
@@ -32,6 +40,8 @@ cargo build --locked --release --target x86_64-pc-windows-msvc
 ```
 
 [GitHub Actions](.github/workflows/windows.yml) 在推送和拉取请求时执行上述检查、构建 Windows x64 程序，并上传 `nextai-translator-windows-x64`。PR 与非默认分支只运行离线测试。推送到默认分支或在该分支手动运行时，CI 额外使用仓库 Secret `NEW_API_KEY` 执行实网测试；密钥缺失或测试失败会阻止打包。
+
+每次 CI 还会生成 `windows-release-assets`（portable 和 Inno Setup 安装包），并静默安装、核对程序、卸载。正式发布时，先提交 `Cargo.toml` 与 `Cargo.lock` 中的新版本号，再给该提交打匹配的稳定版标签（例如版本 `0.1.10` 对应 `v0.1.10`）并推送标签。标签流水线通过后才将两个包作为同一个 GitHub Release 发布；普通分支和 PR 不发布。更新校验不是 Authenticode 签名，Windows 仍可能显示 SmartScreen 提示。
 
 实网验收仅使用 `https://new-api.jamesflare.com` 和 `gpt-6-luna`。本地复测时，通过 T3 密钥卡获取临时文件，把**文件路径**设置为 `NEXTAI_TEST_KEY_FILE`，然后运行以下命令。它会检查模型列表，并分别测试两种协议的思考开/关，不输出密钥。
 
