@@ -85,7 +85,9 @@ fn model_choices_track_the_current_settings_draft(cx: &mut TestAppContext) {
         assert!(view.read(cx).form.models.is_none());
         assert_eq!(view.read(cx).form.model_name(cx), "custom");
         assert!(w.find("model-picker").bounds().size.width > px(450.));
-        assert!(w.try_find("fetch-models").is_none());
+        assert!(
+            w.find("refresh-models").bounds().left() >= w.find("model-picker").bounds().right()
+        );
         view.read(cx)
             .endpoint
             .clone()
@@ -109,7 +111,7 @@ fn model_choices_track_the_current_settings_draft(cx: &mut TestAppContext) {
             .clone()
             .update(cx, |s, cx| s.set_value("test-replacement", w, cx));
         assert!(view.read(cx).current_models(cx).is_none());
-        w.click("model-picker", cx);
+        w.click("refresh-models", cx);
     })
     .unwrap();
     cx.run_until_parked();
@@ -121,6 +123,11 @@ fn model_choices_track_the_current_settings_draft(cx: &mut TestAppContext) {
             None => panic!("no lookup on re-open"),
         };
         assert_eq!(view.read(cx).form.model_name(cx), "custom");
+        w.click("model-picker", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, w, cx| {
         w.input("from-ser", cx);
     })
     .unwrap();

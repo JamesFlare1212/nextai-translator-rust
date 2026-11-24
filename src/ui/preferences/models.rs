@@ -295,14 +295,31 @@ impl Translator {
             }
             _ => menu,
         };
+        let loading = matches!(self.current_models(cx), Some(Models::Loading { .. }));
         field(
             "模型",
-            div()
-                .id("model-picker")
-                .test_support()
-                .aria_label("模型")
+            h_flex()
                 .size_full()
-                .child(menu),
+                .items_center()
+                .gap(px(6.))
+                .child(
+                    div()
+                        .id("model-picker")
+                        .test_support()
+                        .aria_label("模型")
+                        .flex_1()
+                        .min_w_0()
+                        .h_full()
+                        .child(menu),
+                )
+                .child(
+                    icon_button("refresh-models", IconName::RotateCw, "刷新模型列表")
+                        .disabled(loading)
+                        .loading(loading)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.refresh_models(engine::list_models, window, cx)
+                        })),
+                ),
         )
     }
 }
