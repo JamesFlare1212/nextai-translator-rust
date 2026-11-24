@@ -159,6 +159,10 @@ fn websocket_responses_upgrade_streams_and_finishes() {
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
+        #[expect(
+            clippy::result_large_err,
+            reason = "tungstenite fixes the callback error type"
+        )]
         let mut ws = accept_hdr(stream, |r: &Request, response: Response| {
             assert_eq!(r.uri().path(), "/v1/responses");
             assert_eq!(r.headers()["authorization"], format!("Bearer {KEY}"));
