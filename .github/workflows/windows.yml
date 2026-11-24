@@ -86,7 +86,13 @@ jobs:
           '@ | python - (Resolve-Path $exe).Path
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           ./packaging/build.ps1 -Version $v -Executable $exe -OutputDir release-assets
-          ./packaging/test-portable.ps1
+          # Start Windows PowerShell with its own built-in modules, not pwsh's PSModulePath.
+          $modulePath = $env:PSModulePath
+          try {
+            Remove-Item Env:PSModulePath
+            powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ./packaging/test-portable.ps1
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          } finally { $env:PSModulePath = $modulePath }
           $dir = Join-Path $env:RUNNER_TEMP 'NextAI setup test'
           $setup = Get-Item "release-assets/*-setup.exe"
           $p = Start-Process $setup.FullName -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /DIR=`"$dir`"" -Wait -PassThru
