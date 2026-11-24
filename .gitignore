@@ -1,2 +1,7 @@
-/target
-/dist
+# Cargo build output and local release packages
+/target/
+/dist/
+
+# Windows Explorer metadata
+Thumbs.db
+Desktop.ini
