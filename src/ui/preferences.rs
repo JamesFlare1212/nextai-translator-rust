@@ -1,5 +1,5 @@
 mod models;
-use self::models::ModelLookup;
+use self::models::{ModelLookup, ModelPicker};
 pub(super) use self::models::{observe_model_inputs, validate_draft_origin};
 use super::*;
 use crate::{
@@ -50,6 +50,7 @@ pub(super) struct OptionsForm {
     provider: Menu,
     protocol: Menu,
     reasoning: bool,
+    model: ModelPicker,
     models: Option<ModelLookup>,
     theme: Menu,
     target: Picker,
@@ -75,6 +76,7 @@ impl OptionsForm {
             window,
             cx,
         );
+        let model = ModelPicker::new(&settings.model, window, cx);
         let theme = menu(MODES.to_vec(), mode_name(prefs.appearance), window, cx);
         let target = picker(false, window, cx);
         let fonts = super::typography::FontControls::new(prefs, window, cx);
@@ -91,27 +93,30 @@ impl OptionsForm {
                     this.form.cancel_models();
                     this.api_key.update(cx, |s, cx| s.set_value("", w, cx));
                     this.endpoint.update(cx, |s, cx| s.set_value(url, w, cx));
-                    this.model.update(cx, |s, cx| {
-                        s.set_value(preset.map_or("", |p| p.model), w, cx)
-                    });
+                    this.form.model.reset(preset.map_or("", |p| p.model), w, cx);
                 }
                 cx.notify();
             },
         )
         .detach();
-        cx.observe_in(&protocol, window, |this, _, _, cx| {
-            this.discard_stale_models(cx)
+        cx.observe_in(&protocol, window, |this, _, w, cx| {
+            this.discard_stale_models(w, cx)
         })
         .detach();
         Self {
             provider,
             protocol,
             reasoning: settings.reasoning,
+            model,
             models: None,
             theme,
             target,
             fonts,
         }
+    }
+
+    pub(super) fn model_name(&self, cx: &App) -> String {
+        self.model.value(cx)
     }
 
     pub(super) fn cancel_models(&mut self) {
@@ -138,6 +143,7 @@ impl OptionsForm {
         cx: &mut App,
     ) {
         self.cancel_models();
+        self.model.reset(&settings.model, window, cx);
         self.reasoning = settings.reasoning;
         for (select, label) in [
             (&self.provider, provider::identify(&settings.endpoint)),

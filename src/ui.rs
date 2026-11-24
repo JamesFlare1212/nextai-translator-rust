@@ -125,7 +125,6 @@ pub struct Translator {
     pump: Option<Task<()>>,
     settings: Settings,
     endpoint: Entity<InputState>,
-    model: Entity<InputState>,
     api_key: Entity<InputState>,
     notice: Option<String>,
     entries: Vec<Entry>,
@@ -234,7 +233,6 @@ impl Translator {
         }
         let endpoint =
             cx.new(|cx| InputState::new(window, cx).default_value(settings.endpoint.clone()));
-        let model = cx.new(|cx| InputState::new(window, cx).default_value(settings.model.clone()));
         let api_key = cx.new(|cx| {
             InputState::new(window, cx)
                 .masked(true)
@@ -262,7 +260,6 @@ impl Translator {
             cancel: None,
             pump: None,
             endpoint,
-            model,
             api_key,
             settings,
             notice,
@@ -503,7 +500,6 @@ impl Translator {
         }
         for (field, value) in [
             (&self.endpoint, &self.settings.endpoint),
-            (&self.model, &self.settings.model),
             (&self.api_key, &self.settings.api_key),
         ] {
             field.update(cx, |s, cx| s.set_value(value.clone(), window, cx));
@@ -519,7 +515,7 @@ impl Translator {
     fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let settings = Settings {
             endpoint: self.endpoint.read(cx).value().trim().into(),
-            model: self.model.read(cx).value().trim().into(),
+            model: self.form.model_name(cx),
             api_key: self.api_key.read(cx).value().trim().into(),
             api_mode: self.form.api_mode(cx),
             reasoning: self.form.reasoning(),

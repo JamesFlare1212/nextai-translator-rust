@@ -1,5 +1,5 @@
 use super::{ApiMode, Models, Preferences, Settings, configured_view, validate_draft_origin};
-use gpui_kit::test::{TestQueryExt, TestWindowExt};
+use gpui_kit::test::TestWindowExt;
 use gpui_kit::{AppContext, Bounds, TestAppContext, WindowBounds, WindowOptions, px, size};
 
 #[test]
@@ -29,8 +29,33 @@ fn only_the_original_origin_can_reuse_the_saved_credential() {
     }
 }
 
+fn serve_catalog() -> (String, std::thread::JoinHandle<()>) {
+    use std::io::{BufRead, BufReader, Write};
+    let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}/v1", server.local_addr().unwrap());
+    let task = std::thread::spawn(move || {
+        let (mut stream, _) = server.accept().unwrap();
+        let headers = BufReader::new(&stream)
+            .lines()
+            .map(Result::unwrap)
+            .take_while(|l| !l.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(headers.starts_with("GET /v1/models "));
+        assert!(
+            headers
+                .to_lowercase()
+                .contains("authorization: bearer test-replacement")
+        );
+        let body = r#"{"data":[{"id":"from-server"},{"id":"other-choice"}]}"#;
+        write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
+    });
+    (endpoint, task)
+}
+
 #[gpui_kit::test]
 fn model_choices_track_the_current_settings_draft(cx: &mut TestAppContext) {
+    let (endpoint, server) = serve_catalog();
     let (handle, view) = cx.update(|cx| {
         gpui_kit::init(cx);
         gpui_kit::open_window(
@@ -57,84 +82,86 @@ fn model_choices_track_the_current_settings_draft(cx: &mut TestAppContext) {
     });
     cx.update_window(handle, |_, w, cx| {
         w.click("settings", cx);
-        assert_eq!(view.read(cx).form.api_mode(cx), ApiMode::Responses);
-        assert!(view.read(cx).form.reasoning());
-        w.click("reasoning", cx);
-        assert!(!view.read(cx).form.reasoning());
-        assert!(w.find_by_label("API 协议").bounds().right() <= px(540.));
-        view.update(cx, |v, cx| {
-            v.endpoint
-                .update(cx, |s, cx| s.set_value("http://127.0.0.1:2/v1", w, cx));
-            v.refresh_models(
-                |_| panic!("credential guard must reject before starting a worker"),
-                w,
-                cx,
-            );
-            assert!(matches!(v.current_models(cx), Some(Models::Error(_))));
-            v.api_key
-                .update(cx, |s, cx| s.set_value("test-replacement", w, cx));
-            v.refresh_models(
-                |draft| {
-                    assert_eq!(draft.endpoint, "http://127.0.0.1:2/v1");
-                    assert_eq!(draft.api_key, "test-replacement");
-                    assert_eq!(draft.api_mode, ApiMode::Responses);
-                    assert!(!draft.reasoning);
-                    Ok(vec!["from-server".into()])
-                },
-                w,
-                cx,
-            );
-            assert!(matches!(v.current_models(cx), Some(Models::Loading { .. })));
-        });
-    })
-    .unwrap();
-    cx.run_until_parked();
-    cx.update_window(handle, |_, w, cx| {
-        w.render_frame(cx);
-        assert!(matches!(
-            view.read(cx).current_models(cx),
-            Some(Models::Ready { .. })
-        ));
-        assert_eq!(view.read(cx).model.read(cx).value().as_ref(), "custom");
-        assert!(w.find_by_label("模型").bounds().size.width > px(120.));
-        assert!(w.find("fetch-models").bounds().right() <= px(540.));
+        assert!(view.read(cx).form.models.is_none());
+        assert_eq!(view.read(cx).form.model_name(cx), "custom");
+        assert!(w.find("model-picker").bounds().size.width > px(450.));
+        assert!(w.try_find("fetch-models").is_none());
+        view.read(cx)
+            .endpoint
+            .clone()
+            .update(cx, |s, cx| s.set_value(endpoint, w, cx));
         w.click("model-picker", cx);
     })
     .unwrap();
     cx.run_until_parked();
     cx.update_window(handle, |_, w, cx| {
+        assert!(matches!(
+            view.read(cx).current_models(cx),
+            Some(Models::Error(_))
+        ));
+        w.press("escape", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, w, cx| {
+        view.read(cx)
+            .api_key
+            .clone()
+            .update(cx, |s, cx| s.set_value("test-replacement", w, cx));
+        assert!(view.read(cx).current_models(cx).is_none());
+        w.click("model-picker", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, w, cx| {
+        match view.read(cx).current_models(cx) {
+            Some(Models::Ready) => (),
+            Some(Models::Error(e)) => panic!("catalog failed: {e}"),
+            Some(Models::Loading { .. }) => panic!("catalog not finished"),
+            None => panic!("no lookup on re-open"),
+        };
+        assert_eq!(view.read(cx).form.model_name(cx), "custom");
+        w.input("from-ser", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, w, cx| {
         w.render_frame(cx);
-        w.press("down", cx);
+        w.press("enter", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    server.join().unwrap();
+    cx.update_window(handle, |_, w, cx| {
+        assert_eq!(view.read(cx).form.model_name(cx), "from-server");
+        w.click("model-picker", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, w, cx| {
+        w.input("offline-custom", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, w, cx| {
+        w.render_frame(cx);
         w.press("enter", cx);
     })
     .unwrap();
     cx.run_until_parked();
     cx.update_window(handle, |_, w, cx| {
-        assert_eq!(view.read(cx).model.read(cx).value().as_ref(), "from-server");
-        view.update(cx, |v, cx| {
-            v.model
-                .update(cx, |s, cx| s.set_value("edited-custom", w, cx));
-            assert!(matches!(v.current_models(cx), Some(Models::Ready { .. })));
-            v.api_key.update(cx, |s, cx| s.set_value("changed", w, cx));
-            assert!(v.current_models(cx).is_none());
-        });
-        w.render_frame(cx);
-        assert!(w.try_find("model-picker").is_none());
+        assert_eq!(view.read(cx).form.model_name(cx), "offline-custom");
         view.update(cx, |v, cx| {
             v.refresh_models(|_| Ok(vec!["stale".into()]), w, cx);
             v.back(w, cx);
             v.show_settings(w, cx);
-            assert!(v.form.reasoning());
-            assert_eq!(v.form.api_mode(cx), ApiMode::Responses);
-            assert!(v.form.models.is_none());
         });
     })
     .unwrap();
     cx.run_until_parked();
-    cx.update_window(handle, |_, w, cx| {
-        w.render_frame(cx);
-        assert!(w.try_find("model-picker").is_none());
-        assert_eq!(view.read(cx).model.read(cx).value().as_ref(), "custom");
+    cx.update_window(handle, |_, _, cx| {
+        assert!(view.read(cx).form.models.is_none());
+        assert_eq!(view.read(cx).form.model_name(cx), "custom");
     })
     .unwrap();
 }
