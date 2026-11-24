@@ -4,9 +4,17 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing stable tag to rebuild and publish (optional)
+        type: string
+        required: false
 
 permissions:
   contents: read
+
+env:
+  RELEASE_TAG: ${{ inputs.release_tag || (github.ref_type == 'tag' && github.ref_name) || '' }}
 
 jobs:
   windows:
@@ -15,7 +23,14 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
     steps:
+      - name: Validate release tag
+        if: env.RELEASE_TAG != ''
+        shell: pwsh
+        run: |
+          if ($env:RELEASE_TAG -cnotmatch '^v\d+\.\d+\.\d+$') { throw 'Expected a stable release tag' }
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag && format('refs/tags/{0}', inputs.release_tag) || github.sha }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -35,7 +50,7 @@ jobs:
       - name: Offline tests
         run: cargo test --release --locked --all-targets --target x86_64-pc-windows-msvc
       - name: Live API test (gpt-6-luna)
-        if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        if: env.RELEASE_TAG == '' && github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
         env:
           NEXTAI_TEST_API_KEY: ${{ secrets.NEW_API_KEY }}
         run: cargo test --release --locked --bin nextai-translator --target x86_64-pc-windows-msvc -- --ignored --exact live_tests::new_api_gpt_6_luna
@@ -57,9 +72,19 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $v = (cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
-          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -cne "v$v") { throw 'Release tag must match Cargo.toml' }
+          if ($env:RELEASE_TAG -and $env:RELEASE_TAG -cne "v$v") { throw 'Release tag must match Cargo.toml' }
           $exe = 'target/x86_64-pc-windows-msvc/release/nextai-translator.exe'
-          if ((Get-Item $exe).VersionInfo.FileDescription -cne 'NextAI Translator') { throw 'Missing file description' }
+          @'
+          import ctypes as c, sys
+          api = c.windll.version
+          path = sys.argv[1]
+          data = c.create_string_buffer(api.GetFileVersionInfoSizeW(path, None))
+          assert api.GetFileVersionInfoW(path, 0, len(data), data), 'Missing VERSIONINFO'
+          value, length = c.c_void_p(), c.c_uint()
+          assert api.VerQueryValueW(data, r'\StringFileInfo\040904B0\FileDescription', c.byref(value), c.byref(length)), 'Missing FileDescription'
+          assert c.wstring_at(value) == 'NextAI Translator', 'Unexpected FileDescription'
+          '@ | python - (Resolve-Path $exe).Path
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
           ./packaging/build.ps1 -Version $v -Executable $exe -OutputDir release-assets
           ./packaging/test-portable.ps1
           $dir = Join-Path $env:RUNNER_TEMP 'NextAI setup test'
@@ -75,7 +100,7 @@ jobs:
           if-no-files-found: error
 
   publish:
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    if: (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
     needs: windows
     runs-on: ubuntu-latest
     permissions:
@@ -89,6 +114,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 1
-          gh release create "$GITHUB_REF_NAME" release-assets/*.exe --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes --title "$GITHUB_REF_NAME" --draft
-          gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 1
+          gh release create "$RELEASE_TAG" release-assets/*.exe --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes --title "$RELEASE_TAG" --draft
+          gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false
