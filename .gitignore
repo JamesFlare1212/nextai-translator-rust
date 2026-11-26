@@ -1,12 +1,9 @@
-# Cargo build output and local release packages
 /target/
 /dist/
 
-# Local UI verification captures
 /docs/corners/
 /docs/corners.html
 /docs/languages-minimum.png
 
-# Windows Explorer metadata
 Thumbs.db
 Desktop.ini

@@ -1,34 +1,17 @@
-# Windows 版验收记录
+# Windows x64 验收标准
 
-验收对象是 **Windows x64、仅翻译的原生桌面版**。比对基线是 NextAI Translator [`3621e59`](https://github.com/nextai-translator/nextai-translator/tree/3621e591681de518718cc5bc9a1acf18ecd74b16)，不是原项目的浏览器弹窗。未把外部账号、上游的所有专有服务协议或额外工具当作翻译的前提。
+桌面布局以 NextAI Translator [上游版本 3621e59](https://github.com/nextai-translator/nextai-translator/tree/3621e591681de518718cc5bc9a1acf18ecd74b16) 和[默认尺寸基线图](translator-dark.png)为参照。
 
-## 当前传输与更新的验收标准
+## 原生窗口
 
-- Chat Completions 和 Responses 的 HTTP 翻译请求必须设置 `stream: true`；只接受 `text/event-stream` 的成功响应。普通 JSON、错误的媒体类型或不能解码为所选协议的事件立即报错，不切换格式、协议或重新提交。`GET /models` 仍是普通 JSON 接口。
-- 遵循 [Chat Completions](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create)、[Responses 流式事件](https://developers.openai.com/api/reference/resources/responses/streaming-events)和 [Responses WebSocket](https://developers.openai.com/api/docs/guides/websocket-mode) 文档。只显示可见文本，截断、拒绝和不完整输出不能计为翻译成功。单次可重试网络故障不改变用户选择的协议；保留取消和读入限长。
-- 便携版在 Windows 临时目录的 EXE 副本上测试 `self-replace`：校验不符时不替换，新程序无法启动时恢复旧版，成功时原路径是新程序。安装版继续按 Inno Setup 的安装与卸载流程验证。
+- 在 Windows 150% 缩放下，分别以默认 620×700、最小 540×600 逻辑像素检查浅色和深色主题。语言栏、原文框、译文、状态栏和底栏不应重叠或被裁切。
+- 展开语言和设置菜单：选项圆角 6 px、四周内距 4 px、面板圆角 10 px，阴影不计入内距。思考开关的轨道和滑块圆角分别为 10 px 和 8 px，端点内距为 2 px。
+- 原文框获得或失去焦点时都保留单层细边框；字体和字号菜单展开时不增加外圈。在最小窗口打开设置，用同一个模型选择框搜索、选中服务模型或输入自定义名称；保存后重新打开，核对模型、字体和字号。
 
-HTTP 翻译使用社区 Rust SDK `async-openai 0.43` 的流式客户端和类型；不另加 `sse-stream`。SDK 不提供 Responses WebSocket 客户端，该模式使用 `tokio-tungstenite` 传输 SDK 的协议类型。下列既有记录反映当时版本，不代表当前版本还会替网关切换协议。
+## 翻译与更新
 
-本次 Windows x64 MSVC Release 验证：61 项离线测试通过，Clippy 无警告。用原生窗口提交到本地模拟服务，普通 JSON 未触发重发、未写入历史；手动重新提交标准 SSE 后成功。实网使用 `https://new-api.jamesflare.com` 的 `gpt-6-luna`：首轮 Responses 关闭思考遇到一次请求失败；复测 Chat 和 Responses 各自开启、关闭思考，四组均通过。WebSocket 此次只验证本地握手与协议，没有作实网成功声明。
+- [Chat Completions](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create) 和 [Responses](https://developers.openai.com/api/reference/resources/responses/streaming-events) 的 HTTP 翻译请求须设置 `stream: true`，只接受所选协议的 `text/event-stream`。普通 JSON、错误媒体类型或无法解码的事件应报错，不自动重发；`GET /models` 仍使用 JSON。
+- 单独验证 [Responses WebSocket](https://developers.openai.com/api/docs/guides/websocket-mode)：握手成功不等于翻译完成。各传输仅显示可见译文，截断、拒绝或不完整输出不算成功；检查取消和读入限长，重试不得切换协议。
+- 在 Windows 临时目录用便携版 EXE 副本验收更新：校验失败不替换，新程序无法启动时恢复旧版，成功后从原路径启动新版。安装版另验 Inno Setup 安装与卸载。
 
-## 既有验收记录
-
-| 要求 | 实现与验证 |
-| --- | --- |
-| Rust、Longbridge GPUI Kit、仅 Windows | `Cargo.toml` 固定 `gpui-kit = 0.11.0`；`src/main.rs` 创建原生窗口。Cargo 元数据只有一个应用二进制和一个资源构建脚本。本机 release 的 PE 头为 `AMD64 / WINDOWS_GUI`，已在 Windows 启动并关闭，无 WebView 运行时。 |
-| 复刻翻译界面与操作 | 参照 `src-tauri/src/windows.rs` 的 620×700 / 最小 540×600 逻辑像素，以及 `src/common/components/Translator.tsx`。在浏览器中运行上游桌面渲染器取得对照，并在 Windows 原生窗口以 150% 缩放检查了顶部语言栏、可调输入区、译文与状态分隔线、底栏。已移除的模式按钮不占位。见[默认尺寸](translator-dark.png)。 |
-| 设置与焦点 | 150% 缩放实机检查：模型行使用单个选择框，右侧仅保留刷新图标，不另设模型输入框。540 px 宽的 GPUI 交互测试覆盖打开时拉取列表、搜索并选中服务模型，以及使用自定义名称。默认字体 MiSans，验证了更换 Windows 已安装字体、15→18 px 后保存生效。原文框在有、无输入焦点时均为同一细边框。浅色、深色下实机展开字体和字号菜单：触发框没有外圈，仅原有细边框对比度略增。 |
-| 下拉菜单同心圆角 | 在浅色、深色主题下检查了九处菜单。620×700 逻辑像素、Windows 150% 缩放；模型列表使用本地模拟数据。两种语言选择、服务提供商、协议、模型、默认目标语言、外观、字体、字号均保留选项半径 6 px 和四周内距 4 px，只把面板填充的半径调到 10 px。面板外的阴影不计入内距。最小窗口测试从 GPUI 绘制的面板和选项读取半径、边距，验证同心。 |
-| 其他圆角 | 翻译、设置、历史三页：原文框和错误提示为单层 8 px 圆角；状态标签是独立胶囊。按钮、提示框、输入框没有嵌套高亮面板；密钥眼睛按钮仅改变图标色，列表搜索栏没有独立圆角底色。思考开关的轨道和滑块在端点处为 10 px / 8 px 半径、2 px 内距。焦点描边、滚动条、历史行分隔线和系统窗口装饰未改。 |
-| 毛玻璃 | `WindowBackgroundAppearance::Blurred` 使用 Windows 合成器，GPUI 根节点透明，编辑区、顶栏、底栏用可透出背景的表面。在同一桌面检查了浅色和深色窗口，不是预制背景图。 |
-| 翻译确实工作 | Windows `.exe` 通过 `https://new-api.jamesflare.com` 使用 `gpt-6-luna`。Responses 开启思考时，**The train will arrive in ten minutes.** 译为 **火车将在十分钟后到达。**，没有把推理事件显示为译文。 |
-| 0.1.8 冷启动首译（实网） | 在独立 Windows 配置中直接启动 0.1.7，不先拉模型列表。指定服务 `gpt-6-luna` 的 Responses WS 首译和下一次提交均失败；握手成功，首个 `response.create` 的回复是 `type=error, status=503, error.type=new_api_error, error.code=model_not_found`。相同测试参数的 Responses SSE 返回 HTTP 200、译文增量和 `response.completed`。移除服务端模型限制后再测，WS 仍报告无可用渠道；0.1.8 在同一条件下首次及第二次翻译均显示「已翻译（SSE 回退）」。这是对 SSE 回退的实网验证，不代表上游 WS 翻译可用。 |
-| 等待、失败与恢复 | 另用本地 HTTP 测试服务生成可重复的状态：流式文本出现后 Esc 停止，服务端观察到断连；返回 HTTP 429 后点重试，服务端收到第二次请求并返回结果；在最小窗口滚动到长译文第 70 段并清空。没有以模拟翻译替代真实模型测试。 |
-| 无浏览器插件和桌面划词扩展 | 只有桌面应用入口，没有扩展清单、内容脚本、全局选区监听、鼠标钩子或桌面截取路径；`src/ui.rs` 的复制操作限于窗口内。 |
-| 无润色与总结 | `src/engine.rs::translate` 只有翻译与单词释义请求；工具栏和设置没有其他文本任务。语言列表中的 `Polish` 是波兰语。 |
-| 无 TTS 与截图翻译 | 没有朗读、语音合成、截图、OCR、图片上传处理或对应设置。GPUI Kit 启用 `component`、`assets`，不启用语音功能。 |
-| 无生词本和记忆内容生成 | `src/history.rs` 保存完整原文、译文及方向，用于恢复翻译，不收集单词或生成记忆文章。UI 仅有翻译、设置和历史三个视图。 |
-| GitHub CI | `.github/workflows/windows.yml` 配置 push、PR 和手动触发；Windows 执行格式、Clippy、测试、MSVC release 构建并上传可执行文件。工作流通过 `actionlint`。仅默认分支 push 和该分支的手动运行额外执行实网测试。仓库 Secret `NEW_API_KEY` 只注入该步骤；PR 不执行实网测试。 |
-
-本地运行 `cargo fmt --all -- --check`、`cargo clippy --release --locked --all-targets --target x86_64-pc-windows-gnu -- -D warnings`、`cargo test --release --locked --all-targets --target x86_64-pc-windows-gnu` 和相同目标的 `cargo build --release --locked` 均通过。27 项离线测试通过（含切换浅色、深色和跟随系统后的焦点样式）；另行显式运行了 `live_tests::new_api_gpt_6_luna`。它先检查真实模型列表，再分别以 Chat Completions 和 Responses 测试思考开、关四种组合。离线测试覆盖两种流式协议、凭据保护、旧设置迁移、模型列表与自定义输入、历史、语言方向，以及 GPUI 组件上的输入、换行和复制等操作。Windows GNU 是本机验证目标；仓库 CI 配置使用 Windows MSVC，两者没有混称为同一次运行。
+记录验收时注明版本、窗口尺寸和缩放，区分真机界面检查、本地模拟协议测试与实网翻译。实网只用 `https://new-api.jamesflare.com` 的 `gpt-6-luna`，按实际测试的协议和思考开关分别记录结果，不以模拟结果代替实网结论。

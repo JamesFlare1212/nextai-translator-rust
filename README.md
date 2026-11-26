@@ -47,7 +47,7 @@ cargo test --locked --release --all-targets --target x86_64-pc-windows-msvc
 cargo test --locked --release new_api_gpt_6_luna -- --ignored
 ```
 
-实机布局和验证范围见[验收记录](docs/verification.md)。
+实机布局和验证范围见 [Windows x64 验收标准](docs/verification.md)。
 
 ## 来源
 
