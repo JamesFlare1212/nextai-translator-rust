@@ -58,19 +58,15 @@ impl Translator {
                 })
                 .detach();
             }
-            State::Ready(u, dir) => {
+            State::Ready(..) => {
                 if self.status == Status::Running {
                     return;
                 }
-                match updater::restart(dir.path(), self.package, u) {
-                    Ok(()) => {
-                        if let State::Ready(_, dir) =
-                            std::mem::replace(&mut self.update, State::Idle)
-                        {
-                            let _ = dir.keep();
-                        }
-                        cx.quit();
-                    }
+                let State::Ready(u, dir) = std::mem::replace(&mut self.update, State::Idle) else {
+                    unreachable!()
+                };
+                match updater::restart(dir, self.package, &u) {
+                    Ok(()) => cx.quit(),
                     Err(e) => self.update = State::Failed(e),
                 }
             }

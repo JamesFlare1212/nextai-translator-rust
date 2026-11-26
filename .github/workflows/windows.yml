@@ -54,26 +54,26 @@ jobs:
         env:
           NEXTAI_TEST_API_KEY: ${{ secrets.NEW_API_KEY }}
         run: cargo test --release --locked --bin nextai-translator --target x86_64-pc-windows-msvc -- --ignored --exact live_tests::new_api_gpt_6_luna
-      - name: Build Windows executable
-        run: cargo build --release --locked --target x86_64-pc-windows-msvc
+      - name: Build Windows setup and portable
+        run: ./build.ps1
       - name: Package
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist/docs | Out-Null
-          Copy-Item target/x86_64-pc-windows-msvc/release/nextai-translator.exe, LICENSE, README.md dist
+          Copy-Item LICENSE, README.md dist
           Copy-Item docs/* dist/docs
       - uses: actions/upload-artifact@v4
         with:
           name: nextai-translator-windows-x64
           path: dist/
           if-no-files-found: error
-      - name: Build and smoke-test portable and setup
+      - name: Verify executable resources and smoke-test the installer
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $v = (cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
           if ($env:RELEASE_TAG -and $env:RELEASE_TAG -cne "v$v") { throw 'Release tag must match Cargo.toml' }
-          $exe = 'target/x86_64-pc-windows-msvc/release/nextai-translator.exe'
+          $exe = "dist/nextai-translator-$v-windows-x64-portable.exe"
           @'
           import ctypes as c, sys
           api = c.windll.version
@@ -85,14 +85,8 @@ jobs:
           assert c.wstring_at(value) == 'NextAI Translator', 'Unexpected FileDescription'
           '@ | python - (Resolve-Path $exe).Path
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          ./packaging/build.ps1 -Version $v -Executable $exe -OutputDir release-assets
-          # Start Windows PowerShell with its own built-in modules, not pwsh's PSModulePath.
-          $modulePath = $env:PSModulePath
-          try {
-            Remove-Item Env:PSModulePath
-            powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ./packaging/test-portable.ps1
-            if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          } finally { $env:PSModulePath = $modulePath }
+          New-Item -ItemType Directory -Force release-assets | Out-Null
+          Copy-Item "dist/nextai-translator-$v-windows-x64-setup.exe", "dist/nextai-translator-$v-windows-x64-portable.exe" release-assets
           $dir = Join-Path $env:RUNNER_TEMP 'NextAI setup test'
           $setup = Get-Item "release-assets/*-setup.exe"
           $p = Start-Process $setup.FullName -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /DIR=`"$dir`"" -Wait -PassThru

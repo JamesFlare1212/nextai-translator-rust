@@ -2,6 +2,18 @@
 
 验收对象是 **Windows x64、仅翻译的原生桌面版**。比对基线是 NextAI Translator [`3621e59`](https://github.com/nextai-translator/nextai-translator/tree/3621e591681de518718cc5bc9a1acf18ecd74b16)，不是原项目的浏览器弹窗。未把外部账号、上游的所有专有服务协议或额外工具当作翻译的前提。
 
+## 当前传输与更新的验收标准
+
+- Chat Completions 和 Responses 的 HTTP 翻译请求必须设置 `stream: true`；只接受 `text/event-stream` 的成功响应。普通 JSON、错误的媒体类型或不能解码为所选协议的事件立即报错，不切换格式、协议或重新提交。`GET /models` 仍是普通 JSON 接口。
+- 遵循 [Chat Completions](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create)、[Responses 流式事件](https://developers.openai.com/api/reference/resources/responses/streaming-events)和 [Responses WebSocket](https://developers.openai.com/api/docs/guides/websocket-mode) 文档。只显示可见文本，截断、拒绝和不完整输出不能计为翻译成功。单次可重试网络故障不改变用户选择的协议；保留取消和读入限长。
+- 便携版在 Windows 临时目录的 EXE 副本上测试 `self-replace`：校验不符时不替换，新程序无法启动时恢复旧版，成功时原路径是新程序。安装版继续按 Inno Setup 的安装与卸载流程验证。
+
+HTTP 翻译使用社区 Rust SDK `async-openai 0.43` 的流式客户端和类型；不另加 `sse-stream`。SDK 不提供 Responses WebSocket 客户端，该模式使用 `tokio-tungstenite` 传输 SDK 的协议类型。下列既有记录反映当时版本，不代表当前版本还会替网关切换协议。
+
+本次 Windows x64 MSVC Release 验证：61 项离线测试通过，Clippy 无警告。用原生窗口提交到本地模拟服务，普通 JSON 未触发重发、未写入历史；手动重新提交标准 SSE 后成功。实网使用 `https://new-api.jamesflare.com` 的 `gpt-6-luna`：首轮 Responses 关闭思考遇到一次请求失败；复测 Chat 和 Responses 各自开启、关闭思考，四组均通过。WebSocket 此次只验证本地握手与协议，没有作实网成功声明。
+
+## 既有验收记录
+
 | 要求 | 实现与验证 |
 | --- | --- |
 | Rust、Longbridge GPUI Kit、仅 Windows | `Cargo.toml` 固定 `gpui-kit = 0.11.0`；`src/main.rs` 创建原生窗口。Cargo 元数据只有一个应用二进制和一个资源构建脚本。本机 release 的 PE 头为 `AMD64 / WINDOWS_GUI`，已在 Windows 启动并关闭，无 WebView 运行时。 |

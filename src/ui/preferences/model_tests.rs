@@ -29,33 +29,22 @@ fn only_the_original_origin_can_reuse_the_saved_credential() {
     }
 }
 
-fn serve_catalog() -> (String, std::thread::JoinHandle<()>) {
-    use std::io::{BufRead, BufReader, Write};
-    let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let endpoint = format!("http://{}/v1", server.local_addr().unwrap());
-    let task = std::thread::spawn(move || {
-        let (mut stream, _) = server.accept().unwrap();
-        let headers = BufReader::new(&stream)
-            .lines()
-            .map(Result::unwrap)
-            .take_while(|l| !l.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(headers.starts_with("GET /v1/models "));
-        assert!(
-            headers
-                .to_lowercase()
-                .contains("authorization: bearer test-replacement")
-        );
-        let body = r#"{"data":[{"id":"from-server-illustrator","output_modalities":["image"]},{"id":"gpt-image-2.6-flare"},{"id":"from-server"},{"id":"other-choice"}]}"#;
-        write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
-    });
-    (endpoint, task)
-}
-
 #[gpui_kit::test]
 fn model_choices_track_the_current_settings_draft(cx: &mut TestAppContext) {
-    let (endpoint, server) = serve_catalog();
+    let mut server = mockito::Server::new();
+    let endpoint = format!("{}/v1", server.url());
+    let leaked_key = server
+        .mock("GET", "/v1/models")
+        .match_header("authorization", "Bearer test-original")
+        .expect(0)
+        .create();
+    let catalog = server
+        .mock("GET", "/v1/models")
+        .match_header("authorization", "Bearer test-replacement")
+        .expect(3)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"data":[{"id":"from-server-illustrator","output_modalities":["image"]},{"id":"gpt-image-2.6-flare"},{"id":"from-server"},{"id":"other-choice"}]}"#)
+        .create();
     let (handle, view) = cx.update(|cx| {
         gpui_kit::init(cx);
         gpui_kit::open_window(
@@ -157,7 +146,6 @@ fn model_choices_track_the_current_settings_draft(cx: &mut TestAppContext) {
     })
     .unwrap();
     cx.run_until_parked();
-    server.join().unwrap();
     cx.update_window(handle, |_, w, cx| {
         assert_eq!(view.read(cx).form.model_name(cx), "from-server");
         w.click("model-picker", cx);
@@ -190,4 +178,6 @@ fn model_choices_track_the_current_settings_draft(cx: &mut TestAppContext) {
         assert_eq!(view.read(cx).form.model_name(cx), "custom");
     })
     .unwrap();
+    leaked_key.assert();
+    catalog.assert();
 }

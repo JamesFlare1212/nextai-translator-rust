@@ -40,6 +40,28 @@ fn compose_clear_and_cancel_settings_at_minimum_size(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn source_viewport_fills_the_frame_and_keeps_the_last_line_visible(cx: &mut TestAppContext) {
+    let (handle, view) = open_test_window(cx);
+    cx.update_window(handle, |_, w, cx| {
+        w.render_frame(cx);
+        let text = "wrapped source line\n".repeat(40) + "END";
+        w.input(&text, cx);
+        w.render_frame(cx);
+        let editor = view.read(cx).editor.read(cx);
+        let last = editor
+            .range_to_bounds(&(text.len() - 3..text.len()))
+            .unwrap();
+        let frame = w.find(("input", view.read(cx).editor.entity_id())).bounds();
+        let viewport = w.find("input-state").bounds();
+        assert_eq!(viewport.top(), frame.top() + px(1.));
+        assert_eq!(viewport.bottom(), frame.bottom() - px(1.));
+        assert!(last.top() >= viewport.top());
+        assert!(last.bottom() <= viewport.bottom());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
 fn update_status_stays_visible_at_minimum_size(cx: &mut TestAppContext) {
     use super::updates::State;
     let (handle, view) = open_test_window(cx);
@@ -145,6 +167,106 @@ fn language_menu_surface_follows_the_inset_of_the_selected_row(cx: &mut TestAppC
 }
 
 #[gpui_kit::test]
+fn dictionary_markup_is_rendered_but_full_copy_keeps_the_source(cx: &mut TestAppContext) {
+    let (handle, view) = open_test_window(cx);
+    let entry =
+        "**token**  \n**语言：**英语  \n**发音**：英 /ˈtəʊkən/；美 /ˈtoʊkən/\n\n- **释义**：标志";
+    cx.update_window(handle, |_, w, cx| {
+        view.update(cx, |v, cx| {
+            v.entries.push(super::Entry {
+                original: "token".into(),
+                translated: entry.into(),
+                source: super::ENGLISH.into(),
+                target: super::CHINESE.into(),
+            });
+            v.restore(0, w, cx);
+        });
+        w.render_frame(cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, w, cx| {
+        w.render_frame(cx);
+        let runs = gpui_kit::base::test_support::texts(w);
+        assert!(runs.iter().any(|r| r.text().contains("语言：英语")));
+        assert!(runs.iter().any(|r| r.text().contains("发音：英 /ˈtəʊkən/")));
+        assert!(runs.iter().any(|r| r.text().contains("释义：标志")));
+        assert!(!runs.iter().any(|r| r.text().contains("**")));
+        w.click("copy-target", cx);
+        assert_eq!(
+            cx.read_from_clipboard().unwrap().text().as_deref(),
+            Some(entry)
+        );
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn streaming_wakes_on_first_delta_and_batches_retry_replacement(cx: &mut TestAppContext) {
+    use super::{Message, STREAM_CAPACITY, STREAM_FRAME, Status};
+
+    let (_, view) = open_test_window(cx);
+    let (tx, rx) = async_channel::bounded(STREAM_CAPACITY);
+    let (stop, _) = tokio::sync::watch::channel(false);
+    cx.update(|cx| view.update(cx, |v, cx| v.listen(stop, rx, cx)));
+    cx.run_until_parked();
+    tx.try_send(Message::Delta("first".into())).unwrap();
+    cx.run_until_parked();
+    cx.update(|cx| assert_eq!(view.read(cx).output, "first"));
+
+    tx.try_send(Message::Retrying).unwrap();
+    cx.run_until_parked();
+    for update in [
+        Message::Replace("new".into()),
+        Message::Delta(" answer".into()),
+        Message::Finished(Ok(())),
+    ] {
+        tx.try_send(update).unwrap();
+    }
+    cx.run_until_parked();
+    cx.update(|cx| assert_eq!(view.read(cx).output, "first"));
+    cx.executor().advance_clock(STREAM_FRAME);
+    cx.run_until_parked();
+    cx.update(|cx| {
+        let v = view.read(cx);
+        assert_eq!(v.output, "new answer");
+        assert!(!v.retrying);
+        assert!(v.status == Status::Done && v.translation.is_none());
+    });
+}
+
+#[gpui_kit::test]
+fn cancelling_full_inbox_closes_sender_and_discards_stale_completion(cx: &mut TestAppContext) {
+    use super::{Message, Status};
+
+    let (_, view) = open_test_window(cx);
+    let (tx, rx) = async_channel::bounded(2);
+    let (stop, cancelled) = tokio::sync::watch::channel(false);
+    let (new_tx, new_rx) = async_channel::bounded(2);
+    cx.update(|cx| {
+        view.update(cx, |v, cx| {
+            v.status = Status::Running;
+            v.listen(stop, rx, cx);
+            tx.try_send(Message::Delta("stale".into())).unwrap();
+            tx.try_send(Message::Finished(Ok(()))).unwrap();
+            assert!(tx.is_full());
+            v.stop(cx);
+            assert!(*cancelled.borrow());
+            assert!(tx.try_send(Message::Retrying).unwrap_err().is_closed());
+            assert!(v.status == Status::Stopped);
+            v.status = Status::Running;
+            v.listen(tokio::sync::watch::channel(false).0, new_rx, cx);
+        });
+    });
+    new_tx.try_send(Message::Delta("current".into())).unwrap();
+    cx.run_until_parked();
+    cx.update(|cx| {
+        assert_eq!(view.read(cx).output, "current");
+        assert!(view.read(cx).status == Status::Running);
+    });
+}
+
+#[gpui_kit::test]
 fn restored_pair_can_be_copied_without_a_network_request(cx: &mut TestAppContext) {
     let (handle, view) = open_test_window(cx);
     cx.update_window(handle, |_, w, cx| {
@@ -159,7 +281,7 @@ fn restored_pair_can_be_copied_without_a_network_request(cx: &mut TestAppContext
         });
         w.render_frame(cx);
         assert!(view.read(cx).status == super::Status::Done);
-        assert!(view.read(cx).cancel.is_none() && view.read(cx).pump.is_none());
+        assert!(view.read(cx).translation.is_none());
         for (button, expected) in [
             ("copy-source", "The train is here."),
             ("copy-target", "列车到了。"),

@@ -7,20 +7,30 @@ description = "Translation-only NextAI desktop client for Windows"
 license = "AGPL-3.0-only"
 
 [target.'cfg(windows)'.dependencies]
+async-channel = "2"
+async-openai = { version = "0.43", default-features = false, features = ["chat-completion", "responses", "middleware"] }
+bytes = "1"
+http = "1"
+tower = { version = "0.5", features = ["util"] }
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+comrak = { version = "0.59", default-features = false }
 gpui-kit = { version = "=0.11.0", default-features = false, features = ["component", "assets"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "native-tls", "stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 semver = "1"
+self-replace = "1.5.1"
 sha2 = "0.10"
 tempfile = "3"
-tokio = { version = "1", features = ["rt", "time"] }
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 whatlang = "0.16"
+unicode-script = "0.5"
 futures-util = { version = "0.3", features = ["sink"] }
-tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
-windows-sys = { version = "0.61", features = ["Win32_Security_Cryptography", "Win32_Foundation"] }
+tokio-tungstenite = { version = "0.28", features = ["native-tls"] }
+windows-sys = { version = "0.61", features = ["Win32_Security_Cryptography", "Win32_Foundation", "Win32_Storage_FileSystem"] }
 
 [target.'cfg(windows)'.dev-dependencies]
+mockito = "1.7"
 gpui-kit = { version = "=0.11.0", default-features = false, features = ["test-support", "component", "assets"] }
 
 [target.'cfg(windows)'.build-dependencies]

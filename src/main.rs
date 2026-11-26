@@ -12,7 +12,7 @@ mod provider;
 mod ui;
 mod updater;
 
-use gpui_kit::{base::Root, *};
+use gpui_kit::{base::Root, component::TitleBar, *};
 
 fn main() {
     gpui_kit::application()
@@ -33,9 +33,9 @@ fn main() {
                     window_background: WindowBackgroundAppearance::Blurred,
                     titlebar: Some(TitlebarOptions {
                         title: Some("NextAI Translator".into()),
-                        ..Default::default()
+                        ..TitleBar::title_bar_options()
                     }),
-                    ..Default::default()
+                    ..TitleBar::window_options()
                 },
                 |window, cx| {
                     let view = ui::view(window, cx);
