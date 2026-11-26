@@ -86,9 +86,16 @@ enum Page {
 enum Status {
     Idle,
     Running,
+    Retrying,
     Done,
     Stopped,
     Error(String),
+}
+
+impl Status {
+    fn is_running(&self) -> bool {
+        matches!(self, Self::Running | Self::Retrying)
+    }
 }
 
 #[derive(Clone)]
@@ -139,7 +146,6 @@ pub struct Translator {
     output: String,
     dictionary_html: OnceCell<SharedString>,
     translation: Option<TranslationTask>,
-    retrying: bool,
     settings: Settings,
     endpoint: Entity<InputState>,
     api_key: Entity<InputState>,
@@ -277,7 +283,6 @@ impl Translator {
             output: String::new(),
             dictionary_html: OnceCell::new(),
             translation: None,
-            retrying: false,
             endpoint,
             api_key,
             settings,
@@ -292,7 +297,6 @@ impl Translator {
     fn reset(&mut self) {
         self.translation.take();
         self.status = Status::Idle;
-        self.retrying = false;
         self.output.clear();
         self.dictionary_html.take();
         self.request = None;
@@ -300,7 +304,7 @@ impl Translator {
     }
 
     fn stop(&mut self, cx: &mut Context<Self>) {
-        if self.status == Status::Running {
+        if self.status.is_running() {
             self.translation.take();
             self.status = Status::Stopped;
             cx.notify();
@@ -447,9 +451,9 @@ impl Translator {
     fn apply_batch(&mut self, batch: impl Iterator<Item = Message>) -> bool {
         for message in batch {
             match message {
-                Message::Retrying => self.retrying = true,
+                Message::Retrying => self.status = Status::Retrying,
                 Message::Replace(text) => {
-                    self.retrying = false;
+                    self.status = Status::Running;
                     self.output = text;
                     self.dictionary_html.take();
                 }
@@ -692,7 +696,7 @@ impl Translator {
     }
 
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let running = self.status == Status::Running;
+        let running = self.status.is_running();
         let available = !self.editor.read(cx).value().trim().is_empty();
         let choose = |state: &Picker, name: &'static str| {
             div().w(px(126.)).h(px(24.)).flex_shrink_0().child(
@@ -740,7 +744,7 @@ impl Translator {
                     })
                     .disabled(!available && !running)
                     .on_click(cx.listener(|this, _, w, cx| {
-                        if this.status == Status::Running {
+                        if this.status.is_running() {
                             this.stop(cx);
                         } else {
                             this.submit(w, cx);
@@ -808,7 +812,7 @@ impl Translator {
     fn render_result(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let (label, icon) = match self.status {
             Status::Idle => ("", None),
-            Status::Running if self.retrying => ("正在自动重试", None),
+            Status::Retrying => ("正在自动重试", None),
             Status::Running => ("正在翻译", None),
             Status::Done => ("已翻译", Some(IconName::Check)),
             Status::Stopped => ("已停止", Some(IconName::Square)),
@@ -816,7 +820,7 @@ impl Translator {
         };
         let muted = cx.theme().muted_foreground;
         let border = cx.theme().border.opacity(0.6);
-        let running = self.status == Status::Running;
+        let running = self.status.is_running();
         let is_error = matches!(self.status, Status::Error(_));
         let mut result = v_flex().size_full().min_h_0();
         if self.status == Status::Idle {
