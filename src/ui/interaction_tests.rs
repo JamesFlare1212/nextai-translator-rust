@@ -205,10 +205,15 @@ fn dictionary_markup_is_rendered_but_full_copy_keeps_the_source(cx: &mut TestApp
 fn streaming_wakes_on_first_delta_and_batches_retry_replacement(cx: &mut TestAppContext) {
     use super::{Message, STREAM_CAPACITY, STREAM_FRAME, Status};
 
-    let (_, view) = open_test_window(cx);
+    let (handle, view) = open_test_window(cx);
     let (tx, rx) = async_channel::bounded(STREAM_CAPACITY);
     let (stop, _) = tokio::sync::watch::channel(false);
-    cx.update(|cx| view.update(cx, |v, cx| v.listen(stop, rx, cx)));
+    cx.update(|cx| {
+        view.update(cx, |v, cx| {
+            v.status = Status::Running;
+            v.listen(stop, rx, cx);
+        });
+    });
     cx.run_until_parked();
     tx.try_send(Message::Delta("first".into())).unwrap();
     cx.run_until_parked();
@@ -227,12 +232,59 @@ fn streaming_wakes_on_first_delta_and_batches_retry_replacement(cx: &mut TestApp
     cx.update(|cx| assert_eq!(view.read(cx).output, "first"));
     cx.executor().advance_clock(STREAM_FRAME);
     cx.run_until_parked();
-    cx.update(|cx| {
+    cx.update_window(handle, |_, w, cx| {
         let v = view.read(cx);
         assert_eq!(v.output, "new answer");
-        assert!(!v.retrying);
         assert!(v.status == Status::Done && v.translation.is_none());
-    });
+        w.render_frame(cx);
+        assert!(w.find("retry").visible());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn retrying_translation_can_be_stopped_or_replaced(cx: &mut TestAppContext) {
+    use super::{Message, Status, updates::State};
+
+    for stop in [false, true] {
+        let (handle, view) = open_test_window(cx);
+        cx.update_window(handle, |_, w, cx| {
+            let send = |message, cx: &mut gpui_kit::App| {
+                view.update(cx, |v, cx| {
+                    v.apply_batch(std::iter::once(message));
+                    cx.notify();
+                });
+            };
+            view.update(cx, |v, _| {
+                v.status = Status::Running;
+                v.update = State::Ready(crate::updater::test_update(), tempfile::tempdir().unwrap());
+            });
+            send(Message::Delta("first".into()), cx);
+            send(Message::Retrying, cx);
+            w.render_frame(cx);
+            assert_eq!(w.find("translate").label(), Some("停止"));
+            assert!(w.try_find("retry").is_none());
+            w.click("copy-target", cx);
+            assert_eq!(cx.read_from_clipboard().unwrap().text().as_deref(), Some("first"));
+            w.click("settings", cx);
+            assert_eq!(w.find("software-update").disabled(), Some(true));
+            w.click("back", cx);
+            if stop {
+                w.click("translate", cx);
+                assert!(view.read(cx).status == Status::Stopped);
+            } else {
+                send(Message::Replace("new answer".into()), cx);
+                assert!(view.read(cx).status == Status::Running);
+                w.click("copy-target", cx);
+                assert_eq!(cx.read_from_clipboard().unwrap().text().as_deref(), Some("new answer"));
+                send(Message::Finished(Err("stream interrupted".into())), cx);
+                w.render_frame(cx);
+                assert!(matches!(&view.read(cx).status, Status::Error(error) if error == "stream interrupted"));
+            }
+            assert!(w.find("retry").visible());
+        })
+        .unwrap();
+    }
 }
 
 #[gpui_kit::test]

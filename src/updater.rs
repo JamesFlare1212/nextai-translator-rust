@@ -58,6 +58,16 @@ pub struct Update {
     hash: String,
 }
 
+#[cfg(test)]
+pub(crate) fn test_update() -> Update {
+    Update {
+        version: Version::new(1, 0, 0),
+        size: 3,
+        url: String::new(),
+        hash: String::new(),
+    }
+}
+
 fn select(r: Release, kind: Kind, current: &Version) -> Result<Option<Update>, String> {
     if r.draft || r.prerelease {
         return Ok(None);
