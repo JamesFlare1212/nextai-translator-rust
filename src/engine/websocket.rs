@@ -1,6 +1,6 @@
 use super::{
-    INCOMPLETE, MALFORMED, MAX_RESPONSE, PROVIDER_ERROR, Recovery, Responses, Settings, TOO_LARGE,
-    Url, check_cancel,
+    INCOMPLETE, MALFORMED, MAX_RESPONSE, PROVIDER_ERROR, Recovery, Settings, TOO_LARGE,
+    check_cancel, responses::Responses,
 };
 use async_openai::types::responses::{
     CreateResponse, ResponseStreamEvent as Event,
@@ -9,6 +9,7 @@ use async_openai::types::responses::{
     },
 };
 use futures_util::{SinkExt, StreamExt};
+use reqwest::Url;
 use std::{io::ErrorKind, time::Duration};
 use tokio::{sync::watch, time::timeout};
 use tokio_tungstenite::{
@@ -82,9 +83,9 @@ fn socket_error(error: Error, recovery: &mut Recovery) -> String {
 pub(super) async fn translate(
     mut url: Url,
     settings: &Settings,
-    mut body: CreateResponse,
+    body: CreateResponse,
     cancel: &watch::Receiver<bool>,
-    on_delta: &mut impl FnMut(&str),
+    mut emit: impl FnMut(&str) -> Result<(), String>,
     recovery: &mut Recovery,
 ) -> Result<(), String> {
     check_cancel(cancel)?;
@@ -102,8 +103,6 @@ pub(super) async fn translate(
         request.headers_mut().insert(header::AUTHORIZATION, token);
     }
 
-    body.stream = None;
-    body.background = None;
     let create = ResponsesClientEvent::Create(Box::new(ResponsesClientEventResponseCreate {
         response: body,
         ..Default::default()
@@ -141,11 +140,7 @@ pub(super) async fn translate(
                 size += data.len();
                 let event = serde_json::from_str(&data).map_err(|_| MALFORMED)?;
                 if let Some(event) = stream_event(event)?
-                    && responses.event(event, |s| {
-                        check_cancel(cancel)?;
-                        on_delta(s);
-                        check_cancel(cancel)
-                    })?
+                    && responses.event(event, &mut emit)?
                 {
                     return Ok(());
                 }

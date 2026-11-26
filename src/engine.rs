@@ -2,7 +2,6 @@ mod catalog;
 mod responses;
 mod sdk_http;
 mod websocket;
-use catalog::parse_models;
 
 use async_openai::types::{
     chat::{
@@ -11,6 +10,7 @@ use async_openai::types::{
     },
     responses::{CreateResponse, Reasoning},
 };
+use catalog::parse_models;
 use futures_util::StreamExt;
 use reqwest::{Client, RequestBuilder, Response, Url};
 use responses::Responses;
@@ -311,14 +311,13 @@ async fn translate_attempt(
         return Err("请输入要翻译的文本。".into());
     }
     let prompt = translation_prompt(source, target, text);
-    let request = match translation_request(settings, model, &prompt, text) {
-        TranslationRequest::Responses(body) if settings.api_mode == ApiMode::ResponsesWs => {
-            return websocket::translate(url, settings, body, cancel, &mut on_delta, recovery)
-                .await;
-        }
-        request => request,
+    let effort = if settings.reasoning {
+        Some(ReasoningEffort::Medium)
+    } else if supports_no_reasoning(model) {
+        Some(ReasoningEffort::None)
+    } else {
+        None
     };
-    let (sdk, wire) = sdk_http::sdk_client(url, settings)?;
     let mut seen_text = false;
     let mut emit = |s: &str| -> Result<(), String> {
         check_cancel(cancel)?;
@@ -328,8 +327,18 @@ async fn translate_attempt(
         }
         check_cancel(cancel)
     };
-    match request {
-        TranslationRequest::Chat(request) => {
+    match settings.api_mode {
+        ApiMode::ChatCompletions => {
+            let request = CreateChatCompletionRequest {
+                model: model.into(),
+                messages: vec![
+                    ChatCompletionRequestSystemMessage::from(prompt).into(),
+                    ChatCompletionRequestUserMessage::from(text).into(),
+                ],
+                reasoning_effort: effort,
+                ..Default::default()
+            };
+            let (sdk, wire) = sdk_http::sdk_client(url, settings)?;
             let mut stream = sdk
                 .chat()
                 .create_stream(request)
@@ -367,8 +376,14 @@ async fn translate_attempt(
             if !stopped {
                 return Err(INCOMPLETE.into());
             }
+            if !seen_text {
+                return Err(EMPTY.into());
+            }
+            Ok(())
         }
-        TranslationRequest::Responses(request) => {
+        ApiMode::Responses => {
+            let request = responses_body(model, prompt, text, effort);
+            let (sdk, wire) = sdk_http::sdk_client(url, settings)?;
             let mut stream = sdk
                 .responses()
                 .create_stream(request)
@@ -382,59 +397,30 @@ async fn translate_attempt(
                 }
             }
             wire.check(recovery)?;
-            return Err(INCOMPLETE.into());
+            Err(INCOMPLETE.into())
+        }
+        ApiMode::ResponsesWs => {
+            let request = responses_body(model, prompt, text, effort);
+            websocket::translate(url, settings, request, cancel, emit, recovery).await
         }
     }
-    if !seen_text {
-        return Err(EMPTY.into());
-    }
-    Ok(())
 }
 
-#[derive(Serialize)]
-#[serde(untagged)]
-enum TranslationRequest {
-    Chat(CreateChatCompletionRequest),
-    Responses(CreateResponse),
-}
-
-fn translation_request(
-    settings: &Settings,
+fn responses_body(
     model: &str,
-    prompt: &str,
+    prompt: String,
     text: &str,
-) -> TranslationRequest {
-    let effort = if settings.reasoning {
-        Some(ReasoningEffort::Medium)
-    } else if supports_no_reasoning(model) {
-        Some(ReasoningEffort::None)
-    } else {
-        None
-    };
-    match settings.api_mode {
-        ApiMode::ChatCompletions => TranslationRequest::Chat(CreateChatCompletionRequest {
-            model: model.into(),
-            stream: Some(true),
-            messages: vec![
-                ChatCompletionRequestSystemMessage::from(prompt).into(),
-                ChatCompletionRequestUserMessage::from(text).into(),
-            ],
-            reasoning_effort: effort,
+    effort: Option<ReasoningEffort>,
+) -> CreateResponse {
+    CreateResponse {
+        model: Some(model.into()),
+        input: text.into(),
+        instructions: Some(prompt),
+        reasoning: effort.map(|effort| Reasoning {
+            effort: Some(effort),
             ..Default::default()
         }),
-        ApiMode::Responses | ApiMode::ResponsesWs => {
-            TranslationRequest::Responses(CreateResponse {
-                model: Some(model.into()),
-                input: text.into(),
-                instructions: Some(prompt.into()),
-                stream: (settings.api_mode == ApiMode::Responses).then_some(true),
-                reasoning: effort.map(|effort| Reasoning {
-                    effort: Some(effort),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            })
-        }
+        ..Default::default()
     }
 }
 
