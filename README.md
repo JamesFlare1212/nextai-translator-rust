@@ -52,3 +52,5 @@ cargo test --locked --release new_api_gpt_6_luna -- --ignored
 ## 来源
 
 界面、语言选项、操作、简繁体识别字符表和图标参照上游 [`3621e59`](https://github.com/nextai-translator/nextai-translator/tree/3621e591681de518718cc5bc9a1acf18ecd74b16)。本项目是独立定制版本，采用 [AGPL-3.0](LICENSE)。
+
+本项目固定使用[修补版 `gpui-component 0.11.0` 源码](https://github.com/JamesFlare1212/nextai-translator-rust/tree/6fcde9aa48f11737d4a613a7bc3f320f32f98c1a/vendor/gpui-component)（[Apache-2.0 许可证](docs/gpui-component-LICENSE.txt)）。两处修补让下拉菜单面板与列表项的圆角同心，并让复制按钮在显示成功勾号时仍可连续复制。先运行 `cargo fetch --locked` 预取依赖，之后可用 `cargo build --locked --offline` 离线编译。

@@ -37,7 +37,7 @@ gpui-kit = { version = "=0.11.0", default-features = false, features = ["test-su
 embed-resource = "3"
 
 [patch.crates-io]
-gpui-component = { path = "vendor/gpui-component" }
+gpui-component = { git = "https://github.com/JamesFlare1212/nextai-translator-rust.git", rev = "6fcde9aa48f11737d4a613a7bc3f320f32f98c1a" }
 
 [profile.dev]
 debug = 0
