@@ -15,8 +15,8 @@ Use this release notes template, adjusting validation bullets to reflect the che
 
 ## Downloads
 
-- `BrokenArrow-Setup-<VERSION>-x64.exe`: Windows x64 installer.
-- `BrokenArrow-Portable-<VERSION>-x64.exe`: Windows x64 portable application.
+- `nextai-translator-<VERSION>-windows-x64-setup.exe`: Windows x64 installer.
+- `nextai-translator-<VERSION>-windows-x64-portable.exe`: Windows x64 portable application.
 
 ## Validation
 

@@ -58,19 +58,15 @@ impl Translator {
                 })
                 .detach();
             }
-            State::Ready(u, dir) => {
-                if self.status == Status::Running {
+            State::Ready(..) => {
+                if self.status.is_running() {
                     return;
                 }
-                match updater::restart(dir.path(), self.package, u) {
-                    Ok(()) => {
-                        if let State::Ready(_, dir) =
-                            std::mem::replace(&mut self.update, State::Idle)
-                        {
-                            let _ = dir.keep();
-                        }
-                        cx.quit();
-                    }
+                let State::Ready(u, dir) = std::mem::replace(&mut self.update, State::Idle) else {
+                    unreachable!()
+                };
+                match updater::restart(dir, self.package, &u) {
+                    Ok(()) => cx.quit(),
                     Err(e) => self.update = State::Failed(e),
                 }
             }
@@ -104,7 +100,7 @@ impl Translator {
             ),
             State::Ready(u, _) => (
                 format!("{} 已准备就绪", u.version),
-                if self.status == Status::Running {
+                if self.status.is_running() {
                     "请等待当前翻译结束"
                 } else {
                     "重启前请保存设置，并复制需要保留的草稿"
@@ -164,7 +160,7 @@ impl Translator {
                         button
                             .disabled(
                                 busy || (matches!(self.update, State::Ready(..))
-                                    && self.status == Status::Running),
+                                    && self.status.is_running()),
                             )
                             .on_click(cx.listener(|this, _, _, cx| this.update_action(cx))),
                     ),

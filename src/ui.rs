@@ -1,3 +1,4 @@
+mod dictionary;
 mod language;
 mod preferences;
 mod typography;
@@ -11,9 +12,9 @@ use crate::{
 };
 use gpui_kit::{
     assets::IconName,
-    base::SelectableText,
+    base::{SelectableText, TextView},
     component::{
-        ActiveTheme, Disableable, IndexPath, Sizable,
+        ActiveTheme, Disableable, IndexPath, Sizable, TitleBar,
         button::{Button, ButtonVariants},
         clipboard::Clipboard,
         h_flex,
@@ -27,14 +28,8 @@ use gpui_kit::{
     prelude::*,
     *,
 };
-use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-        mpsc,
-    },
-    time::Duration,
-};
+use std::{cell::OnceCell, sync::Arc, time::Duration};
+use tokio::sync::watch;
 
 gpui_kit::actions!(translator, [OpenSettings, GoBack]);
 
@@ -91,9 +86,16 @@ enum Page {
 enum Status {
     Idle,
     Running,
+    Retrying,
     Done,
     Stopped,
     Error(String),
+}
+
+impl Status {
+    fn is_running(&self) -> bool {
+        matches!(self, Self::Running | Self::Retrying)
+    }
 }
 
 #[derive(Clone)]
@@ -105,14 +107,30 @@ struct Request {
 }
 
 enum Message {
-    UsingSse,
     Retrying,
     Replace(String),
     Delta(String),
     Finished(Result<(), String>),
 }
 
+const STREAM_CAPACITY: usize = 128;
+const STREAM_FRAME: Duration = Duration::from_millis(24);
+
+struct TranslationTask {
+    stop: watch::Sender<bool>,
+    inbox: async_channel::Receiver<Message>,
+    _pump: Task<()>,
+}
+
+impl Drop for TranslationTask {
+    fn drop(&mut self) {
+        self.stop.send_replace(true);
+        self.inbox.close();
+    }
+}
+
 pub struct Translator {
+    app_icon: Arc<Image>,
     focus: FocusHandle,
     page: Page,
     editor: Entity<TextareaState>,
@@ -126,10 +144,8 @@ pub struct Translator {
     status: Status,
     request: Option<Request>,
     output: String,
-    cancel: Option<Arc<AtomicBool>>,
-    pump: Option<Task<()>>,
-    retrying: bool,
-    using_sse_fallback: bool,
+    dictionary_html: OnceCell<SharedString>,
+    translation: Option<TranslationTask>,
     settings: Settings,
     endpoint: Entity<InputState>,
     api_key: Entity<InputState>,
@@ -159,14 +175,6 @@ fn configured_view(
     cx.new(|cx| Translator::new(window, cx, loaded))
 }
 
-impl Drop for Translator {
-    fn drop(&mut self) {
-        if let Some(cancel) = &self.cancel {
-            cancel.store(true, Ordering::Release);
-        }
-    }
-}
-
 impl Translator {
     fn new(
         window: &mut Window,
@@ -184,7 +192,7 @@ impl Translator {
         };
         let editor = cx.new(|cx| {
             TextareaState::new(window, cx)
-                .rows(10)
+                .rows(1)
                 .submit_on_enter(true)
                 .placeholder("输入要翻译的文本…")
         });
@@ -256,6 +264,10 @@ impl Translator {
             endpoint.focus_handle(cx).focus(window, cx);
         }
         Self {
+            app_icon: Arc::new(Image::from_bytes(
+                ImageFormat::Ico,
+                include_bytes!("../assets/nextai.ico").to_vec(),
+            )),
             focus: cx.focus_handle(),
             page,
             editor,
@@ -269,10 +281,8 @@ impl Translator {
             status: Status::Idle,
             request: None,
             output: String::new(),
-            cancel: None,
-            pump: None,
-            retrying: false,
-            using_sse_fallback: false,
+            dictionary_html: OnceCell::new(),
+            translation: None,
             endpoint,
             api_key,
             settings,
@@ -284,26 +294,18 @@ impl Translator {
         }
     }
 
-    fn abort(&mut self) {
-        if let Some(cancel) = self.cancel.take() {
-            cancel.store(true, Ordering::Release);
-        }
-        self.pump.take();
-    }
-
     fn reset(&mut self) {
-        self.abort();
+        self.translation.take();
         self.status = Status::Idle;
-        self.retrying = false;
-        self.using_sse_fallback = false;
         self.output.clear();
+        self.dictionary_html.take();
         self.request = None;
         self.notice = None;
     }
 
     fn stop(&mut self, cx: &mut Context<Self>) {
-        if self.status == Status::Running {
-            self.abort();
+        if self.status.is_running() {
+            self.translation.take();
             self.status = Status::Stopped;
             cx.notify();
         }
@@ -372,10 +374,9 @@ impl Translator {
         self.reset();
         self.request = Some(request.clone());
         self.status = Status::Running;
-        let cancel = Arc::new(AtomicBool::new(false));
-        let flag = cancel.clone();
+        let (stop, cancel) = watch::channel(false);
         let settings = self.settings.clone();
-        let (tx, rx) = mpsc::sync_channel(128);
+        let (tx, rx) = async_channel::bounded(STREAM_CAPACITY);
         let worker = std::thread::Builder::new()
             .name("translation".into())
             .spawn(move || {
@@ -384,88 +385,93 @@ impl Translator {
                     request.source,
                     request.target,
                     &request.text,
-                    &flag,
+                    &cancel,
                     |update| {
-                        if !flag.load(Ordering::Acquire) {
-                            let _ = tx.send(match update {
-                                engine::StreamUpdate::Append(s) => Message::Delta(s.to_owned()),
-                                engine::StreamUpdate::Replace(s) => Message::Replace(s.to_owned()),
-                                engine::StreamUpdate::UsingSse => Message::UsingSse,
-                                engine::StreamUpdate::Retrying => Message::Retrying,
-                            });
-                        }
+                        let _ = tx.send_blocking(match update {
+                            engine::StreamUpdate::Append(s) => Message::Delta(s.to_owned()),
+                            engine::StreamUpdate::Replace(s) => Message::Replace(s.to_owned()),
+                            engine::StreamUpdate::Retrying => Message::Retrying,
+                        });
                     },
                 );
-                let _ = tx.send(Message::Finished(result));
+                let _ = tx.send_blocking(Message::Finished(result));
             });
         if let Err(e) = worker {
             self.status = Status::Error(e.to_string());
             cx.notify();
             return;
         }
-        self.cancel = Some(cancel);
-        self.pump = Some(cx.spawn(async move |this, cx| {
-            loop {
-                let mut delta = String::new();
-                let mut end = None;
-                let mut retrying = None;
-                let mut using_sse = false;
-                let mut replace = false;
-                for _ in 0..256 {
-                    match rx.try_recv() {
-                        Ok(Message::UsingSse) => using_sse = true,
-                        Ok(Message::Retrying) => retrying = Some(true),
-                        Ok(Message::Replace(chunk)) => {
-                            replace = true;
-                            retrying = Some(false);
-                            delta = chunk;
-                        }
-                        Ok(Message::Delta(chunk)) => delta.push_str(&chunk),
-                        Ok(Message::Finished(result)) => {
-                            end = Some(result);
-                            break;
-                        }
-                        Err(mpsc::TryRecvError::Empty) => break,
-                        Err(mpsc::TryRecvError::Disconnected) => {
-                            end = Some(Err("翻译线程已退出。".into()));
-                            break;
-                        }
-                    }
-                }
-                let finished = end.is_some();
-                if (!delta.is_empty() || finished || retrying.is_some() || using_sse)
-                    && this
-                        .update(cx, |this, cx| {
-                            this.using_sse_fallback |= using_sse;
-                            if replace {
-                                this.output.clear();
-                            }
-                            if let Some(retrying) = retrying {
-                                this.retrying = retrying;
-                            }
-                            this.output.push_str(&delta);
-                            if let Some(result) = end {
-                                this.finish(result);
-                            }
-                            cx.notify();
-                        })
-                        .is_err()
-                {
-                    break;
-                }
-                if finished {
-                    break;
-                }
-                cx.background_executor()
-                    .timer(Duration::from_millis(24))
-                    .await;
-            }
-        }));
+        self.listen(stop, rx, cx);
         cx.notify();
     }
 
+    fn listen(
+        &mut self,
+        stop: watch::Sender<bool>,
+        inbox: async_channel::Receiver<Message>,
+        cx: &mut Context<Self>,
+    ) {
+        let cancel = stop.subscribe();
+        let rx = inbox.clone();
+        let pump = cx.spawn(async move |this, cx| {
+            let executor = cx.background_executor().clone();
+            let mut next_frame = executor.now();
+            loop {
+                let first = rx
+                    .recv()
+                    .await
+                    .unwrap_or_else(|_| Message::Finished(Err("翻译线程已退出。".into())));
+                let delay = next_frame.saturating_duration_since(executor.now());
+                if !delay.is_zero() && !matches!(first, Message::Finished(_)) {
+                    executor.timer(delay).await;
+                }
+                let batch = std::iter::once(first)
+                    .chain((1..STREAM_CAPACITY).map_while(|_| rx.try_recv().ok()));
+                let keep_listening = this.update(cx, |this, cx| {
+                    if *cancel.borrow() {
+                        return false;
+                    }
+                    let more = this.apply_batch(batch);
+                    cx.notify();
+                    more
+                });
+                if !matches!(keep_listening, Ok(true)) {
+                    break;
+                }
+                next_frame = executor.now() + STREAM_FRAME;
+            }
+        });
+        self.translation = Some(TranslationTask {
+            stop,
+            inbox,
+            _pump: pump,
+        });
+    }
+
+    fn apply_batch(&mut self, batch: impl Iterator<Item = Message>) -> bool {
+        for message in batch {
+            match message {
+                Message::Retrying => self.status = Status::Retrying,
+                Message::Replace(text) => {
+                    self.status = Status::Running;
+                    self.output = text;
+                    self.dictionary_html.take();
+                }
+                Message::Delta(text) => {
+                    self.output.push_str(&text);
+                    self.dictionary_html.take();
+                }
+                Message::Finished(result) => {
+                    self.finish(result);
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     fn finish(&mut self, result: Result<(), String>) {
-        self.cancel.take();
+        self.translation.take();
         self.status = match result {
             Err(error) => Status::Error(error),
             Ok(()) => {
@@ -684,12 +690,13 @@ impl Translator {
             text: entry.original.into(),
         });
         self.output = entry.translated;
+        self.dictionary_html.take();
         self.status = Status::Done;
         self.back(window, cx);
     }
 
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let running = self.status == Status::Running;
+        let running = self.status.is_running();
         let available = !self.editor.read(cx).value().trim().is_empty();
         let choose = |state: &Picker, name: &'static str| {
             div().w(px(126.)).h(px(24.)).flex_shrink_0().child(
@@ -737,7 +744,7 @@ impl Translator {
                     })
                     .disabled(!available && !running)
                     .on_click(cx.listener(|this, _, w, cx| {
-                        if this.status == Status::Running {
+                        if this.status.is_running() {
                             this.stop(cx);
                         } else {
                             this.submit(w, cx);
@@ -759,7 +766,7 @@ impl Translator {
             .pb(px(18.))
             .gap(px(4.))
             .child(
-                div().flex_1().min_h_0().child(
+                div().flex_1().min_h_0().overflow_hidden().child(
                     Textarea::new(&self.editor)
                         .aria_label("原文")
                         .bordered(false)
@@ -805,11 +812,7 @@ impl Translator {
     fn render_result(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let (label, icon) = match self.status {
             Status::Idle => ("", None),
-            Status::Running if self.using_sse_fallback => ("WebSocket 无可用渠道，改用 SSE", None),
-            Status::Done if self.using_sse_fallback => {
-                ("已翻译（SSE 回退）", Some(IconName::Check))
-            }
-            Status::Running if self.retrying => ("正在自动重试", None),
+            Status::Retrying => ("正在自动重试", None),
             Status::Running => ("正在翻译", None),
             Status::Done => ("已翻译", Some(IconName::Check)),
             Status::Stopped => ("已停止", Some(IconName::Square)),
@@ -817,7 +820,7 @@ impl Translator {
         };
         let muted = cx.theme().muted_foreground;
         let border = cx.theme().border.opacity(0.6);
-        let running = self.status == Status::Running;
+        let running = self.status.is_running();
         let is_error = matches!(self.status, Status::Error(_));
         let mut result = v_flex().size_full().min_h_0();
         if self.status == Status::Idle {
@@ -852,12 +855,28 @@ impl Translator {
         );
         let mut body = v_flex().w_full().gap(px(8.)).px(px(18.)).py(px(12.));
         if !self.output.is_empty() {
+            let dictionary = self
+                .request
+                .as_ref()
+                .is_some_and(|r| engine::possible_word(&r.text));
+            let text = if dictionary {
+                let html = self
+                    .dictionary_html
+                    .get_or_init(|| dictionary::html(&self.output).into());
+                TextView::html("dictionary-entry", html.clone())
+                    .link(|_, _| None)
+                    .image_source(|_| ImageSource::Custom(Arc::new(|_, _| None)))
+                    .scrollable(false)
+                    .into_any_element()
+            } else {
+                SelectableText::new("translation", self.output.clone()).into_any_element()
+            };
             body = body.child(
                 div()
                     .w_full()
                     .text_size(px(self.preferences.font_size.into()))
                     .line_height(px(f32::from(self.preferences.font_size) * 1.55))
-                    .child(SelectableText::new("translation", self.output.clone())),
+                    .child(text),
             );
         }
         if let Status::Error(error) = &self.status {
@@ -1115,7 +1134,17 @@ impl Render for Translator {
                 } else {
                     this.stop(cx)
                 }
-            }));
+            }))
+            .child(
+                TitleBar::new()
+                    .bg(cx.theme().background.opacity(0.36))
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(img(self.app_icon.clone()).size(px(16.)))
+                            .child(Label::new("NextAI Translator").text_sm()),
+                    ),
+            );
         root = match self.page {
             Page::Translator => root.child(self.render_header(cx)).child(
                 div().flex_1().min_h_0().w_full().child(

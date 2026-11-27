@@ -1,5 +1,6 @@
 use crate::engine::{ApiMode, Settings, list_models, translate};
-use std::{env, fs, sync::atomic::AtomicBool};
+use std::{env, fs};
+use tokio::sync::watch;
 
 #[test]
 #[ignore = "显式运行，使用真实 API 额度"]
@@ -24,24 +25,27 @@ fn new_api_gpt_6_luna() {
         models.contains(&settings.model),
         "端点的模型列表不含 gpt-6-luna"
     );
+    let mut failures = Vec::new();
     for api_mode in [ApiMode::ChatCompletions, ApiMode::Responses] {
         for reasoning in [false, true] {
             settings.api_mode = api_mode;
             settings.reasoning = reasoning;
             let mut out = String::new();
-            translate(
+            let result = translate(
                 &settings,
                 "English",
                 "Simplified Chinese",
                 "The cat is sleeping.",
-                &AtomicBool::new(false),
+                &watch::channel(false).1,
                 |s| out.push_str(s),
-            )
-            .unwrap_or_else(|err| panic!("{api_mode:?} reasoning={reasoning}: {err}"));
-            assert!(
-                out.contains('猫') && out.contains('睡'),
-                "{api_mode:?} reasoning={reasoning}: 未收到预期语义的译文"
             );
+            let outcome = match result {
+                Ok(()) if out.contains('猫') && out.contains('睡') => continue,
+                Ok(()) => "未收到预期语义的译文".into(),
+                Err(message) => message,
+            };
+            failures.push(format!("{api_mode:?} reasoning={reasoning}: {outcome}"));
         }
     }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }

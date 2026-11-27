@@ -1,50 +1,94 @@
-use super::*;
+use super::{
+    INCOMPLETE, MALFORMED, MAX_RESPONSE, PROVIDER_ERROR, Recovery, Settings, TOO_LARGE,
+    check_cancel, responses::Responses,
+};
+use async_openai::types::responses::{
+    CreateResponse, ResponseStreamEvent as Event,
+    websocket::{
+        ResponsesClientEvent, ResponsesClientEventResponseCreate, ResponsesServerEvent as Ws,
+    },
+};
 use futures_util::{SinkExt, StreamExt};
-use tokio::time::timeout;
+use reqwest::Url;
+use std::{io::ErrorKind, time::Duration};
+use tokio::{sync::watch, time::timeout};
 use tokio_tungstenite::{
     connect_async_with_config,
-    tungstenite::{Error, Message, client::IntoClientRequest, protocol::WebSocketConfig},
+    tungstenite::{
+        Error, Message, client::IntoClientRequest, error::ProtocolError, http::header,
+        protocol::WebSocketConfig,
+    },
 };
 
-fn provider_failure(data: &[u8], first_event: bool) -> (String, Recovery) {
-    let Ok(event) = serde_json::from_slice::<serde_json::Value>(data) else {
-        return (PROVIDER_ERROR.into(), Recovery::None);
-    };
-    let status = event["status"].as_u64().filter(|n| (400..=599).contains(n));
-    let error = event
-        .get("error")
-        .or_else(|| event.pointer("/response/error"));
-    let code = error.and_then(|e| e["code"].as_str());
-    if first_event
-        && event["type"] == "error"
-        && status == Some(503)
-        && code == Some("model_not_found")
-        && error.is_some_and(|e| e["type"] == "new_api_error")
-    {
-        return (
-            "WebSocket 无可用模型渠道（503/model_not_found）。".into(),
-            Recovery::NoWsRoute,
-        );
-    }
-    let label = match code {
-        Some("model_not_found") => "模型不可用（model_not_found）",
-        Some("invalid_api_key") => "API 密钥无效",
-        Some("insufficient_quota") => "额度不足",
-        Some("rate_limit_exceeded") => "请求受到限流",
-        Some("invalid_request_error") => "请求参数无效",
-        _ => "服务返回错误",
-    };
-    let status = status.map(|n| format!("，状态码 {n}")).unwrap_or_default();
-    (format!("WebSocket {label}{status}。"), Recovery::None)
+fn stream_event(event: Ws) -> Result<Option<Event>, String> {
+    Ok(Some(match event {
+        Ws::ResponseOutputTextDelta(e) => Event::ResponseOutputTextDelta(e.event),
+        Ws::ResponseRefusalDelta(e) => Event::ResponseRefusalDelta(e.event),
+        Ws::ResponseRefusalDone(e) => Event::ResponseRefusalDone(e.event),
+        Ws::ResponseContentPartAdded(e) => Event::ResponseContentPartAdded(e.event),
+        Ws::ResponseContentPartDone(e) => Event::ResponseContentPartDone(e.event),
+        Ws::ResponseOutputItemAdded(e) => Event::ResponseOutputItemAdded(e.event),
+        Ws::ResponseOutputItemDone(e) => Event::ResponseOutputItemDone(e.event),
+        Ws::ResponseIncomplete(e) => Event::ResponseIncomplete(e.event),
+        Ws::ResponseFailed(e) => Event::ResponseFailed(e.event),
+        Ws::ResponseCompleted(e) => Event::ResponseCompleted(e.event),
+        Ws::Error(e) => {
+            return Err(match e.status {
+                Some(status @ 400..=599) => format!("WebSocket 服务返回错误（{status}）。"),
+                _ => PROVIDER_ERROR.into(),
+            });
+        }
+        Ws::SteerFailed(_) => return Err(PROVIDER_ERROR.into()),
+        _ => return Ok(None),
+    }))
 }
 
-pub(super) async fn translate<F: FnMut(&str)>(
+fn interrupted(recovery: &mut Recovery, message: &str) -> String {
+    *recovery = Recovery::Interrupted;
+    message.into()
+}
+
+fn socket_error(error: Error, recovery: &mut Recovery) -> String {
+    match error {
+        Error::Http(r) => format!(
+            "WebSocket 握手失败（HTTP {}），请检查服务是否支持 Responses WebSocket 及密钥权限。",
+            r.status().as_u16()
+        ),
+        Error::Capacity(_) => TOO_LARGE.into(),
+        Error::ConnectionClosed => INCOMPLETE.into(),
+        Error::Protocol(ProtocolError::ResetWithoutClosingHandshake) => {
+            interrupted(recovery, INCOMPLETE)
+        }
+        Error::Io(e)
+            if matches!(
+                e.kind(),
+                ErrorKind::ConnectionRefused
+                    | ErrorKind::ConnectionReset
+                    | ErrorKind::ConnectionAborted
+                    | ErrorKind::BrokenPipe
+                    | ErrorKind::UnexpectedEof
+                    | ErrorKind::NotConnected
+                    | ErrorKind::TimedOut
+                    | ErrorKind::NetworkDown
+                    | ErrorKind::NetworkUnreachable
+                    | ErrorKind::HostUnreachable
+            ) =>
+        {
+            interrupted(recovery, INCOMPLETE)
+        }
+        _ => "WebSocket 协议或安全连接出错。".into(),
+    }
+}
+
+pub(super) async fn translate(
     mut url: Url,
     settings: &Settings,
-    mut body: serde_json::Value,
-    answer: &mut Answer<'_, F>,
+    body: CreateResponse,
+    cancel: &watch::Receiver<bool>,
+    mut emit: impl FnMut(&str) -> Result<(), String>,
     recovery: &mut Recovery,
 ) -> Result<(), String> {
+    check_cancel(cancel)?;
     let scheme = if url.scheme() == "https" { "wss" } else { "ws" };
     url.set_scheme(scheme).map_err(|_| "WebSocket 地址无效。")?;
     let mut request = url
@@ -53,84 +97,55 @@ pub(super) async fn translate<F: FnMut(&str)>(
         .map_err(|_| "WebSocket 地址无效。")?;
     if !settings.api_key.trim().is_empty() {
         let mut token = format!("Bearer {}", settings.api_key.trim())
-            .parse::<reqwest::header::HeaderValue>()
+            .parse::<header::HeaderValue>()
             .map_err(|_| "API 密钥无效。")?;
         token.set_sensitive(true);
-        request
-            .headers_mut()
-            .insert(reqwest::header::AUTHORIZATION, token);
+        request.headers_mut().insert(header::AUTHORIZATION, token);
     }
+
+    let create = ResponsesClientEvent::Create(Box::new(ResponsesClientEventResponseCreate {
+        response: body,
+        ..Default::default()
+    }));
+    let payload = serde_json::to_string(&create).map_err(|_| MALFORMED)?;
     let config = WebSocketConfig::default()
         .max_message_size(Some(MAX_RESPONSE))
         .max_frame_size(Some(MAX_RESPONSE));
-    let transport_error = |e: Error| match e {
-        Error::Http(r) => format!(
-            "WebSocket 握手失败（HTTP {}），请检查服务是否支持 Responses WebSocket 及密钥权限。",
-            r.status().as_u16()
-        ),
-        Error::Capacity(_) => TOO_LARGE.into(),
-        Error::Io(_)
-        | Error::ConnectionClosed
-        | Error::Protocol(
-            tokio_tungstenite::tungstenite::error::ProtocolError::ResetWithoutClosingHandshake,
-        ) => {
-            *recovery = Recovery::Interrupted;
-            INCOMPLETE.into()
-        }
-        _ => "WebSocket 协议或安全连接出错。".into(),
-    };
-    let mut transport_error = transport_error;
     let (mut socket, _) = timeout(
         Duration::from_secs(15),
         connect_async_with_config(request, Some(config), false),
     )
     .await
-    .map_err(|_| "WebSocket 连接超时。")?
-    .map_err(&mut transport_error)?;
-    body.as_object_mut()
-        .expect("translation request object")
-        .remove("stream");
-    body["type"] = json!("response.create");
-    let input = body["input"].take();
-    body["input"] = json!([{"role":"user", "content":input}]);
-    timeout(
-        Duration::from_secs(15),
-        socket.send(Message::text(body.to_string())),
-    )
-    .await
-    .map_err(|_| "WebSocket 发送超时。")?
-    .map_err(&mut transport_error)?;
+    .map_err(|_| interrupted(recovery, "WebSocket 连接超时。"))?
+    .map_err(|e| socket_error(e, recovery))?;
+    timeout(Duration::from_secs(15), socket.send(Message::text(payload)))
+        .await
+        .map_err(|_| interrupted(recovery, "WebSocket 发送超时。"))?
+        .map_err(|e| socket_error(e, recovery))?;
+
+    let mut responses = Responses::default();
     let mut size = 0;
     loop {
-        let msg = match timeout(Duration::from_secs(120), socket.next()).await {
-            Ok(Some(msg)) => msg.map_err(&mut transport_error)?,
-            _ => {
-                *recovery = Recovery::Interrupted;
-                return Err(INCOMPLETE.into());
-            }
-        };
+        let msg = timeout(Duration::from_secs(120), socket.next())
+            .await
+            .map_err(|_| interrupted(recovery, "译文流长时间没有响应。"))?
+            .ok_or(INCOMPLETE)?
+            .map_err(|e| socket_error(e, recovery))?;
+        check_cancel(cancel)?;
         match msg {
             Message::Text(data) => {
                 if data.len() > MAX_RESPONSE - size {
                     return Err(TOO_LARGE.into());
                 }
-                let first_event = size == 0;
                 size += data.len();
-                match answer.decode(data.as_bytes(), Some(b"")) {
-                    Ok(true) => return answer.complete(),
-                    Ok(false) => {}
-                    Err(e) if e == PROVIDER_ERROR => {
-                        let (detail, next) = provider_failure(data.as_bytes(), first_event);
-                        *recovery = next;
-                        return Err(detail);
-                    }
-                    Err(e) => return Err(e),
+                let event = serde_json::from_str(&data).map_err(|_| MALFORMED)?;
+                if let Some(event) = stream_event(event)?
+                    && responses.event(event, &mut emit)?
+                {
+                    return Ok(());
                 }
             }
-            Message::Close(_) => {
-                *recovery = Recovery::Interrupted;
-                return Err(INCOMPLETE.into());
-            }
+            Message::Close(_) => return Err(INCOMPLETE.into()),
             Message::Ping(_) | Message::Pong(_) => continue,
             _ => return Err(MALFORMED.into()),
         }
@@ -142,63 +157,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_an_explicit_route_rejection_before_generation_can_switch_transport() {
-        for (first, kind, status, code, origin, fallback) in [
-            (true, "error", 503, "model_not_found", "new_api_error", true),
+    fn server_errors_do_not_reveal_arbitrary_fields() {
+        let server_error = serde_json::from_str(
+            r#"{"type":"error","status":503,"error":{"message":"sensitive","code":"sensitive"}}"#,
+        )
+        .unwrap();
+        let message = stream_event(server_error).unwrap_err();
+        assert!(message.contains("503"));
+        assert!(!message.contains("sensitive"));
+    }
+
+    #[test]
+    fn transport_loss_is_distinct_from_a_clean_close_or_protocol_error() {
+        for (err, retry) in [
+            (Error::ConnectionClosed, false),
             (
-                false,
-                "error",
-                503,
-                "model_not_found",
-                "new_api_error",
+                Error::Protocol(ProtocolError::UnmaskedFrameFromClient),
                 false,
             ),
+            (Error::Io(ErrorKind::InvalidData.into()), false),
             (
+                Error::Protocol(ProtocolError::ResetWithoutClosingHandshake),
                 true,
-                "response.failed",
-                503,
-                "model_not_found",
-                "new_api_error",
-                false,
             ),
-            (
-                true,
-                "error",
-                404,
-                "model_not_found",
-                "new_api_error",
-                false,
-            ),
-            (
-                true,
-                "error",
-                503,
-                "model_not_found",
-                "invalid_request_error",
-                false,
-            ),
-            (
-                true,
-                "error",
-                401,
-                "invalid_api_key",
-                "new_api_error",
-                false,
-            ),
-            (
-                true,
-                "error",
-                429,
-                "insufficient_quota",
-                "new_api_error",
-                false,
-            ),
+            (Error::Io(ErrorKind::ConnectionReset.into()), true),
         ] {
-            let event = json!({"type":kind, "status":status,"error":{"code":code,"type":origin,"message":"sensitive-content"}});
-            let (detail, recovery) = provider_failure(event.to_string().as_bytes(), first);
-            assert_eq!(recovery == Recovery::NoWsRoute, fallback);
-            assert!(detail.contains(&status.to_string()));
-            assert!(!detail.contains("sensitive-content"));
+            let mut recovery = Recovery::None;
+            let _ = socket_error(err, &mut recovery);
+            assert_eq!(recovery == Recovery::Interrupted, retry);
         }
     }
 }

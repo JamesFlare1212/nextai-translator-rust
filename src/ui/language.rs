@@ -1,5 +1,6 @@
 use gpui_kit::{SharedString, component::select::SelectItem};
 use std::{collections::HashMap, sync::LazyLock};
+use unicode_script::{Script, UnicodeScript};
 
 #[derive(Clone, Copy)]
 pub(super) struct Language(
@@ -118,18 +119,14 @@ pub(super) fn detect(text: &str) -> Option<&'static str> {
         .filter(|line| !line.trim_start().starts_with("{{<"))
         .collect::<Vec<_>>()
         .join(" ");
-    let kana = |c| matches!(c, '\u{3040}'..='\u{30ff}');
-    let hangul = |c| matches!(c, '\u{ac00}'..='\u{d7a3}' | '\u{1100}'..='\u{11ff}');
-    if sample.chars().any(kana) {
+    let scripts = || sample.chars().map(|c| c.script());
+    if scripts().any(|s| matches!(s, Script::Hiragana | Script::Katakana)) {
         return Some("Japanese");
     }
-    if sample.chars().any(hangul) {
+    if scripts().any(|s| s == Script::Hangul) {
         return Some("Korean");
     }
-    let han = sample
-        .chars()
-        .filter(|c| matches!(c, '\u{3400}'..='\u{9fff}'))
-        .count();
+    let han = scripts().filter(|&s| s == Script::Han).count();
     let info = whatlang::detect(&sample);
     if han > 0
         && (han * 2 >= sample.chars().filter(|c| c.is_alphabetic()).count()
@@ -184,5 +181,18 @@ pub(super) fn automatic_target(
         reverse
     } else {
         preferred
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_extended_and_halfwidth_scripts_without_treating_punctuation_as_kana() {
+        assert_eq!(detect("𠮷"), Some(CHINESE));
+        assert_eq!(detect("ｺﾝﾆﾁﾊ"), Some("Japanese"));
+        assert_eq!(detect("ㄱㅏ"), Some("Korean"));
+        assert_eq!(detect("简体中文・翻译"), Some(CHINESE));
     }
 }

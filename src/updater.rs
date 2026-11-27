@@ -1,8 +1,8 @@
+mod portable;
+
 use semver::Version;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-#[cfg(windows)]
-use std::path::Path;
 use std::{future::Future, io::Write, time::Duration};
 use tempfile::TempDir;
 
@@ -56,6 +56,16 @@ pub struct Update {
     pub size: u64,
     url: String,
     hash: String,
+}
+
+#[cfg(test)]
+pub(crate) fn test_update() -> Update {
+    Update {
+        version: Version::new(1, 0, 0),
+        size: 3,
+        url: String::new(),
+        hash: String::new(),
+    }
 }
 
 fn select(r: Release, kind: Kind, current: &Version) -> Result<Option<Update>, String> {
@@ -162,12 +172,15 @@ async fn download_with(client: reqwest::Client, u: &Update) -> Result<TempDir, S
     Ok(dir)
 }
 #[cfg(windows)]
-pub fn restart(dir: &Path, kind: Kind, u: &Update) -> Result<(), String> {
+pub fn restart(dir: TempDir, kind: Kind, u: &Update) -> Result<(), String> {
     use std::{os::windows::process::CommandExt, process::Command};
+    if matches!(kind, Kind::Portable) {
+        return portable::restart(&dir.path().join("update.exe"), u);
+    }
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let shell = Path::new(&std::env::var_os("SystemRoot").ok_or("无法定位 Windows")?)
+    let shell = std::path::Path::new(&std::env::var_os("SystemRoot").ok_or("无法定位 Windows")?)
         .join("System32/WindowsPowerShell/v1.0/powershell.exe");
-    let script = dir.join("apply.ps1");
+    let script = dir.path().join("apply.ps1");
     std::fs::write(&script, include_bytes!("../packaging/apply.ps1")).map_err(|e| e.to_string())?;
     Command::new(shell)
         .args([
@@ -181,12 +194,12 @@ pub fn restart(dir: &Path, kind: Kind, u: &Update) -> Result<(), String> {
         .arg(script)
         .env("NEXTAI_PARENT", std::process::id().to_string())
         .env("NEXTAI_TARGET", exe)
-        .env("NEXTAI_STAGE", dir)
-        .env("NEXTAI_KIND", kind.slug())
+        .env("NEXTAI_STAGE", dir.path())
         .env("NEXTAI_HASH", &u.hash)
         .creation_flags(0x08000000)
         .spawn()
         .map_err(|e| e.to_string())?;
+    let _ = dir.keep();
     Ok(())
 }
 
@@ -198,31 +211,22 @@ mod tests {
     }
     #[test]
     fn verify_download_before_staging() {
-        use std::{
-            io::{Read, Write},
-            net::TcpListener,
-            thread,
-        };
+        let mut server = mockito::Server::new();
+        let asset = server
+            .mock("GET", "/update.exe")
+            .with_body("abc")
+            .expect(4)
+            .create();
         for (size, digest, valid) in [
             (3, Sha256::digest(b"abc"), true),
             (3, Sha256::digest(b"bad"), false),
             (2, Sha256::digest(b"abc"), false),
             (4, Sha256::digest(b"abc"), false),
         ] {
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            let url = format!("http://{}", listener.local_addr().unwrap());
-            let server = thread::spawn(move || {
-                let (mut s, _) = listener.accept().unwrap();
-                let _ = s.read(&mut [0; 4096]).unwrap();
-                s.write_all(
-                    b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nabc",
-                )
-                .unwrap();
-            });
             let update = Update {
                 version: Version::new(1, 0, 0),
                 size,
-                url,
+                url: format!("{}/update.exe", server.url()),
                 hash: format!("{digest:x}"),
             };
             let result = run(download_with(
@@ -236,8 +240,8 @@ mod tests {
                     b"abc"
                 );
             }
-            server.join().unwrap();
         }
+        asset.assert();
     }
     #[test]
     fn release_selection() {
